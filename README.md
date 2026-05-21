@@ -35,8 +35,8 @@ GCP project.
 ## Requirements
 
 - [Terraform](https://www.terraform.io/downloads.html) >= 1.13
-- [Go](https://golang.org/doc/install) >= 1.24 (only for building from
-  source)
+- [Go](https://golang.org/doc/install) >= 1.26 (only for building from
+  source; the exact version is pinned in [`.tool-versions`](./.tool-versions))
 - A pre-existing global Compute URL map you have `compute.urlMaps.get`
   and `compute.urlMaps.patch` permission on.
 
