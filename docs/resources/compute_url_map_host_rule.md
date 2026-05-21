@@ -31,6 +31,8 @@ resource "crugcp_compute_url_map_host_rule" "app_stage" {
 ### Required
 
 - `default_service` (String) Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.
+
+Self-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.
 - `hosts` (List of String) Hostnames whose requests should be routed to `default_service`. At least one required.
 - `name` (String) Unique name for this entry within the URL map. Used as both `host_rule.path_matcher` (the cross-reference) and `path_matcher.name`. Forces replacement on change.
 - `url_map` (String) The global Compute URL map to splice into. Accepts the canonical resource path `projects/{project}/global/urlMaps/{name}` or the equivalent self link. Forces replacement on change — moving an entry between URL maps is destroy-and-recreate.

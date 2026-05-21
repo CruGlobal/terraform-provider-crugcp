@@ -130,6 +130,79 @@ func TestRemoveEntry_missingIsNoOp(t *testing.T) {
 	}
 }
 
+func TestCanonicalResourcePath(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "www.googleapis.com prefix is stripped",
+			in:   "https://www.googleapis.com/compute/v1/projects/p/global/backendServices/b",
+			want: "projects/p/global/backendServices/b",
+		},
+		{
+			name: "compute.googleapis.com prefix is stripped",
+			in:   "https://compute.googleapis.com/compute/v1/projects/p/global/backendServices/b",
+			want: "projects/p/global/backendServices/b",
+		},
+		{
+			name: "short form passes through unchanged",
+			in:   "projects/p/global/backendServices/b",
+			want: "projects/p/global/backendServices/b",
+		},
+		{
+			name: "unknown self-link prefix passes through unchanged",
+			in:   "https://other.googleapis.com/v1/projects/p/things/t",
+			want: "https://other.googleapis.com/v1/projects/p/things/t",
+		},
+		{
+			name: "empty string passes through",
+			in:   "",
+			want: "",
+		},
+		{
+			name: "// self link passes through",
+			in:   "//compute.googleapis.com/projects/p/global/backendServices/b",
+			want: "//compute.googleapis.com/projects/p/global/backendServices/b",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalResourcePath(tc.in); got != tc.want {
+				t.Fatalf("canonicalResourcePath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFindEntry_canonicalisesDefaultService seeds the URL map with the
+// self-link form GCP returns on Read and asserts that findEntry hands
+// state the canonical short form. This is the wiring test for the
+// perma-diff fix; if it regresses, consumers using short paths in
+// config will see plan churn after every apply.
+func TestFindEntry_canonicalisesDefaultService(t *testing.T) {
+	m := &computepb.UrlMap{
+		HostRules: []*computepb.HostRule{
+			{Hosts: []string{"app.example.com"}, PathMatcher: proto.String("app")},
+		},
+		PathMatchers: []*computepb.PathMatcher{
+			{
+				Name:           proto.String("app"),
+				DefaultService: proto.String("https://www.googleapis.com/compute/v1/projects/p/global/backendServices/b"),
+			},
+		},
+	}
+	got, ok := findEntry(m, "app")
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if got.DefaultService != "projects/p/global/backendServices/b" {
+		t.Fatalf("default_service not canonicalised: %q", got.DefaultService)
+	}
+}
+
 func TestFindEntry_halfSplicedReturnsFalse(t *testing.T) {
 	m := &computepb.UrlMap{
 		HostRules: []*computepb.HostRule{

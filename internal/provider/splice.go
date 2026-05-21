@@ -9,9 +9,38 @@
 package provider
 
 import (
+	"strings"
+
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"google.golang.org/protobuf/proto"
 )
+
+// computeAPIPrefixes are the two self-link forms the Compute API
+// returns for global resources. We rewrite either to the canonical
+// resource-path form so user-supplied short paths don't perma-diff
+// against the long forms the API echoes back on Read.
+//
+// Anything not matching one of these prefixes is returned untouched —
+// over-canonicalising (e.g., rewriting a self link from a different
+// API, or a future Compute prefix we don't recognise yet) is a worse
+// failure mode than a perma-diff, because state silently disagrees
+// with the live resource.
+var computeAPIPrefixes = []string{
+	"https://www.googleapis.com/compute/v1/",
+	"https://compute.googleapis.com/compute/v1/",
+}
+
+// canonicalResourcePath strips a Compute API self-link prefix from s
+// and returns the trailing resource-path form. Inputs that don't
+// match a known prefix are returned unchanged.
+func canonicalResourcePath(s string) string {
+	for _, p := range computeAPIPrefixes {
+		if strings.HasPrefix(s, p) {
+			return strings.TrimPrefix(s, p)
+		}
+	}
+	return s
+}
 
 // entrySpec is the in-memory representation of a single host-rule /
 // path-matcher pair that this provider owns. One entry maps to exactly
@@ -103,9 +132,14 @@ func findEntry(m *computepb.UrlMap, name string) (entrySpec, bool) {
 	}
 
 	return entrySpec{
-		Name:           name,
-		Hosts:          append([]string(nil), host.GetHosts()...),
-		DefaultService: matcher.GetDefaultService(),
+		Name:  name,
+		Hosts: append([]string(nil), host.GetHosts()...),
+		// Canonicalise the default-service path so callers using the
+		// documented short form don't perma-diff against the self
+		// link the API echoes back. findEntry is the single point
+		// where API-returned values enter our types, so handling it
+		// here covers Read, post-Patch re-read, and Import.
+		DefaultService: canonicalResourcePath(matcher.GetDefaultService()),
 		// Prefer the HostRule's description, but fall back to the
 		// PathMatcher's: this provider writes the same value to both,
 		// so either being present is enough. Surface neither field

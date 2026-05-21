@@ -108,7 +108,7 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 				},
 			},
 			"default_service": schema.StringAttribute{
-				MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.",
+				MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.\n\nSelf-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.",
 				Required:            true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(1),
