@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Build, lint, unit tests, and drift checks. setup-go reads the
+  # `golang` line from .tool-versions so the local toolchain (asdf)
+  # and CI cannot drift.
+  build:
+    name: build (vet + lint + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: .tool-versions
+          cache: true
+
+      # tfplugindocs (run via `go generate`) launches a local
+      # terraform binary to read the provider's schema, and main.go
+      # has a `//go:generate terraform fmt` directive — both need the
+      # CLI on PATH before the docs-drift check runs.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12
+          args: --tests=false
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        run: go test -count=1 -cover ./...
+
+      - name: Verify generated docs are up to date
+        run: |
+          go generate ./...
+          git diff --exit-code docs/ examples/

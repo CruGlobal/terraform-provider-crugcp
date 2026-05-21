@@ -1,0 +1,29 @@
+name: Lint PR
+
+on:
+  # pull_request (not pull_request_target) so this workflow runs from
+  # the PR's head ref instead of the base ref. With pull_request_target,
+  # the workflow doesn't exist on main on the very first PR that
+  # introduces it, so it never fires — but it's still required to merge.
+  # The PR comes from an internal feature branch, so the reduced
+  # GITHUB_TOKEN scope of pull_request (vs pull_request_target) is not
+  # an issue here.
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+permissions:
+  pull-requests: read
+  statuses: write
+
+jobs:
+  semantic-pr:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,110 @@
+# https://taskfile.dev
+version: "3"
+
+vars:
+  NAME: crugcp
+  BINARY: terraform-provider-{{.NAME}}
+
+env:
+  CGO_ENABLED: "0"
+
+tasks:
+  default:
+    desc: Run unit tests
+    cmds:
+      - task: test
+
+  build:
+    desc: Build the provider binary
+    cmds:
+      - go build -o {{.BINARY}}
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BINARY}}"
+
+  install:
+    desc: Install the provider binary into $GOBIN (or $GOPATH/bin) for use with terraform dev_overrides
+    silent: true
+    cmds:
+      - go install .
+      - |
+        BIN_DIR="$(go env GOBIN)"
+        : "${BIN_DIR:=$(go env GOPATH)/bin}"
+        cat <<EOF
+
+        Installed to ${BIN_DIR}/{{.BINARY}}
+
+        Add this to ~/.terraformrc and run terraform without 'terraform init':
+
+          provider_installation {
+            dev_overrides {
+              "CruGlobal/crugcp" = "${BIN_DIR}"
+            }
+            direct {}
+          }
+        EOF
+
+  tidy:
+    desc: Run go mod tidy
+    cmds:
+      - go mod tidy
+
+  fmt:
+    desc: Format Go and Terraform files
+    cmds:
+      - gofmt -s -w -e .
+      - terraform fmt -recursive ./examples/
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run --tests=false
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test -count=1 -cover ./...
+
+  generate:
+    desc: Regenerate provider docs from schema (requires terraform on PATH)
+    cmds:
+      - go generate ./...
+
+  # Acceptance tests hit real GCP and cost real $$. They require:
+  #
+  #   CRUGCP_ACC_PROJECT             — project owning the URL map
+  #   CRUGCP_ACC_URL_MAP             — projects/.../global/urlMaps/...
+  #   CRUGCP_ACC_BACKEND_SERVICE     — backend resource for default_service
+  #   CRUGCP_ACC_ALT_BACKEND_SERVICE — alternate backend used in update step
+  #
+  # plus credentials that can call compute.urlMaps.{get,patch} on the
+  # target map (ADC works if `gcloud auth application-default login`
+  # was run with a principal that holds those permissions).
+  testacc:
+    desc: Run acceptance tests against a real GCP project
+    env:
+      TF_ACC: "1"
+    preconditions:
+      - sh: test -n "$CRUGCP_ACC_PROJECT"
+        msg: "CRUGCP_ACC_PROJECT must be set"
+      - sh: test -n "$CRUGCP_ACC_URL_MAP"
+        msg: "CRUGCP_ACC_URL_MAP must be set"
+      - sh: test -n "$CRUGCP_ACC_BACKEND_SERVICE"
+        msg: "CRUGCP_ACC_BACKEND_SERVICE must be set"
+      - sh: test -n "$CRUGCP_ACC_ALT_BACKEND_SERVICE"
+        msg: "CRUGCP_ACC_ALT_BACKEND_SERVICE must be set"
+    cmds:
+      - go test -v -cover -count=1 -timeout 60m ./internal/provider/...
+
+  release:snapshot:
+    desc: Build a local snapshot release with goreleaser
+    cmds:
+      - goreleaser release --clean --snapshot

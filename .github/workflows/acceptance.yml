@@ -1,0 +1,103 @@
+name: acceptance
+
+# Acceptance tests hit real GCP Compute API endpoints — each run
+# costs a small amount of money and consumes API quota on a real URL
+# map. Intentionally not wired to push/PR triggers. Runs:
+#
+#   * weekly on Monday at 13:00 UTC, to catch regressions caused by
+#     upstream Go SDK or terraform-plugin-framework changes that the
+#     unit tests can't see.
+#   * on demand via workflow_dispatch (use this when working on a PR
+#     that touches the Compute integration path).
+#
+# Requires these repo secrets to be set up beforehand:
+#
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  — full resource name of the WIF
+#                                     pool provider, e.g.
+#                                     projects/.../locations/global/workloadIdentityPools/.../providers/...
+#   GCP_SERVICE_ACCOUNT             — email of the SA that holds
+#                                     compute.urlMaps.{get,patch} on
+#                                     the acceptance URL map.
+#   CRUGCP_ACC_PROJECT              — project that owns the URL map.
+#   CRUGCP_ACC_URL_MAP              — projects/.../global/urlMaps/...
+#   CRUGCP_ACC_BACKEND_SERVICE      — default_service value for the
+#                                     basic test.
+#   CRUGCP_ACC_ALT_BACKEND_SERVICE  — alternate default_service value
+#                                     used in the update step.
+#
+# Workload-identity federation avoids storing a long-lived SA key in
+# the repo. If WIF isn't an option, replace google-github-actions/auth
+# with `credentials_json: ${{ secrets.GCP_SA_KEY }}` and skip the
+# `workload_identity_provider` / `service_account` inputs.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # One acceptance run at a time — concurrent runs would race each
+  # other over the shared URL map and trip the very fingerprint-retry
+  # logic the tests are meant to exercise from a single writer.
+  group: acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: acceptance (terraform ${{ matrix.terraform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform:
+          - "1.13.*"
+          - "1.14.*"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: .tool-versions
+          cache: true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Run acceptance tests
+        env:
+          TF_ACC: "1"
+          CRUGCP_ACC_PROJECT: ${{ secrets.CRUGCP_ACC_PROJECT }}
+          CRUGCP_ACC_URL_MAP: ${{ secrets.CRUGCP_ACC_URL_MAP }}
+          CRUGCP_ACC_BACKEND_SERVICE: ${{ secrets.CRUGCP_ACC_BACKEND_SERVICE }}
+          CRUGCP_ACC_ALT_BACKEND_SERVICE: ${{ secrets.CRUGCP_ACC_ALT_BACKEND_SERVICE }}
+        run: go test -v -cover -count=1 -timeout 60m ./internal/provider/...
+
+  # Aggregator job. Branch protection cannot require an individual
+  # matrix leg by name (the names change as the matrix changes, and
+  # skipped legs report as missing). This single job succeeds only
+  # if every leg of `acceptance` succeeded.
+  acceptance-matrix:
+    name: acceptance matrix
+    runs-on: ubuntu-latest
+    needs: acceptance
+    if: always()
+    steps:
+      - name: Check matrix status
+        if: ${{ needs.acceptance.result != 'success' }}
+        run: exit 1

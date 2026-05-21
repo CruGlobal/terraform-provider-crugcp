@@ -1,0 +1,40 @@
+version: 2
+
+updates:
+  # Go module dependencies. Group minor + patch bumps into a single
+  # weekly PR so reviewers see one diff per category, not twenty.
+  # Major bumps are intentionally left ungrouped — each gets its own
+  # PR and a manual migration check.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions used by .github/workflows/**. One batched PR per
+  # week for minor + patch bumps; majors stay per-PR.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
