@@ -1,7 +1,14 @@
 name: Lint PR
 
 on:
-  pull_request_target:
+  # pull_request (not pull_request_target) so this workflow runs from
+  # the PR's head ref instead of the base ref. With pull_request_target,
+  # the workflow doesn't exist on main on the very first PR that
+  # introduces it, so it never fires — but it's still required to merge.
+  # The PR comes from an internal feature branch, so the reduced
+  # GITHUB_TOKEN scope of pull_request (vs pull_request_target) is not
+  # an issue here.
+  pull_request:
     types:
       - opened
       - edited
@@ -10,6 +17,7 @@ on:
 
 permissions:
   pull-requests: read
+  statuses: write
 
 jobs:
   semantic-pr:
