@@ -18,8 +18,12 @@ import (
 	"google.golang.org/api/option"
 )
 
-// Default HTTP timeout matches the hashicorp/google provider's default.
-const defaultRequestTimeoutSeconds = 60
+// Default request timeout. Each "call" here is the full Get + Patch +
+// op.Wait round-trip the resource uses to splice an entry; global URL
+// map operations regularly take 30–90s to propagate, so anything close
+// to 60s loses to flaky timeouts on otherwise-healthy applies. 5
+// minutes gives propagation room without masking a stuck operation.
+const defaultRequestTimeout = 5 * time.Minute
 
 var _ provider.Provider = &crugcpProvider{}
 
@@ -91,7 +95,7 @@ func (p *crugcpProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 				Optional:            true,
 			},
 			"request_timeout": schema.StringAttribute{
-				MarkdownDescription: "Timeout applied to each underlying Compute API call as a Go `time.Duration` string (for example `\"60s\"`, `\"2m\"`). Defaults to `60s`.",
+				MarkdownDescription: "Timeout applied to each underlying Compute API round-trip (Get + Patch + operation wait) as a Go `time.Duration` string (for example `\"60s\"`, `\"5m\"`). Defaults to `5m` — global URL map operations regularly take 30–90s to propagate, so shorter timeouts trip on healthy applies.",
 				Optional:            true,
 			},
 			"request_reason": schema.StringAttribute{
@@ -132,7 +136,7 @@ func (p *crugcpProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	impersonate := stringValueOrEnv(cfg.ImpersonateServiceAccount, "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT")
 	requestReason := stringValueOrEnv(cfg.RequestReason, "CLOUDSDK_CORE_REQUEST_REASON")
 
-	timeout := time.Duration(defaultRequestTimeoutSeconds) * time.Second
+	timeout := defaultRequestTimeout
 	if !cfg.RequestTimeout.IsNull() && cfg.RequestTimeout.ValueString() != "" {
 		parsed, err := time.ParseDuration(cfg.RequestTimeout.ValueString())
 		if err != nil {
