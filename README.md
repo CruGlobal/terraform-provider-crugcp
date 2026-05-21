@@ -74,7 +74,7 @@ resource "crugcp_compute_url_map_host_rule" "app_stage" {
 | `credentials`                   | Path to a service-account JSON key file, or the JSON contents inline. Falls back to `GOOGLE_*` env vars, then ADC.   |
 | `access_token`                  | Short-lived OAuth access token. Mutually exclusive with `credentials` and `impersonate_service_account`.             |
 | `impersonate_service_account`   | Service account to impersonate. The principal supplying credentials needs `roles/iam.serviceAccountTokenCreator`.    |
-| `request_timeout`               | Go duration string (default `60s`) applied to each Compute API call.                                                 |
+| `request_timeout`               | Go duration string (default `5m`) applied to each Compute API round-trip — Get + Patch + operation wait.             |
 | `request_reason`                | Value sent in the `X-Goog-Request-Reason` header; surfaces in GCP audit logs.                                        |
 
 Full reference docs (generated from the provider schema) live in
@@ -105,10 +105,54 @@ Common workflows are defined in [`Taskfile.yaml`](./Taskfile.yaml):
 
 ```sh
 task build       # compile the provider
+task install     # install the binary into $GOBIN for use with dev_overrides
 task test        # run unit tests
 task generate    # regenerate docs from schema (needs terraform on PATH)
 task testacc     # run acceptance tests against a real GCP project
 ```
+
+### Testing a local build against real Terraform configs
+
+Terraform's `dev_overrides` mechanism lets you point Terraform at a
+locally-built provider binary instead of resolving the provider through
+the registry. This is the right tool for iterating on provider changes
+against a real Terraform config before tagging a release.
+
+1. Build and install:
+
+   ```sh
+   task install
+   ```
+
+   `task install` prints the exact `~/.terraformrc` snippet you need —
+   the path is whatever `go env GOBIN` resolves to (or
+   `$(go env GOPATH)/bin` if `GOBIN` is unset).
+
+2. Add the printed block to `~/.terraformrc` (create the file if it
+   doesn't exist):
+
+   ```hcl
+   provider_installation {
+     dev_overrides {
+       "CruGlobal/crugcp" = "/Users/you/go/bin"
+     }
+
+     # Leaves all other providers using the normal registry flow.
+     direct {}
+   }
+   ```
+
+3. In your test config, **do not run `terraform init`** — `dev_overrides`
+   are mutually exclusive with the lockfile. Run `terraform plan` /
+   `terraform apply` directly. Terraform will print a warning that
+   confirms the override is active:
+
+   ```
+   Warning: Provider development overrides are in effect
+   ```
+
+4. Iterate: `task install` after each code change to refresh the
+   binary, then re-run `terraform plan`.
 
 Acceptance tests cost real GCP API calls. They require a project, a
 pre-provisioned URL map, and two backend services (or NEGs) to route

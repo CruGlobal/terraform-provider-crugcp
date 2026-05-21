@@ -25,6 +25,28 @@ tasks:
     generates:
       - "{{.BINARY}}"
 
+  install:
+    desc: Install the provider binary into $GOBIN (or $GOPATH/bin) for use with terraform dev_overrides
+    silent: true
+    cmds:
+      - go install .
+      - |
+        BIN_DIR="$(go env GOBIN)"
+        : "${BIN_DIR:=$(go env GOPATH)/bin}"
+        cat <<EOF
+
+        Installed to ${BIN_DIR}/{{.BINARY}}
+
+        Add this to ~/.terraformrc and run terraform without 'terraform init':
+
+          provider_installation {
+            dev_overrides {
+              "CruGlobal/crugcp" = "${BIN_DIR}"
+            }
+            direct {}
+          }
+        EOF
+
   tidy:
     desc: Run go mod tidy
     cmds:
