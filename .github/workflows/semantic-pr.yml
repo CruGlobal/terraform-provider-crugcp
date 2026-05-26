@@ -27,3 +27,22 @@ jobs:
       - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Keep this aligned with the `changelog-sections` types in
+          # release-please-config.json. `deps` in particular is what
+          # Dependabot uses (configured in .github/dependabot.yml);
+          # leaving it off the allowlist would block every dependency
+          # update PR.
+          types: |
+            feat
+            fix
+            perf
+            revert
+            deps
+            refactor
+            docs
+            build
+            ci
+            test
+            chore
+            style
