@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -56,6 +58,19 @@ type urlMapHostRuleModel struct {
 	Hosts          types.List   `tfsdk:"hosts"`
 	DefaultService types.String `tfsdk:"default_service"`
 	Description    types.String `tfsdk:"description"`
+	PathRules      types.List   `tfsdk:"path_rules"`
+}
+
+type pathRuleModel struct {
+	Paths   types.List   `tfsdk:"paths"`
+	Service types.String `tfsdk:"service"`
+}
+
+func pathRuleObjectType() types.ObjectType {
+	return types.ObjectType{AttrTypes: map[string]attr.Type{
+		"paths":   types.ListType{ElemType: types.StringType},
+		"service": types.StringType,
+	}}
 }
 
 func (r *urlMapHostRuleResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -112,6 +127,30 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 				Required:            true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"path_rules": schema.ListNestedAttribute{
+				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins regardless of list order. Patterns must start with `/` and may use `*` only after a final `/` (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.",
+				Optional:            true,
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"paths": schema.ListAttribute{
+							MarkdownDescription: "Path patterns to match. At least one required; each must start with `/`.",
+							Required:            true,
+							ElementType:         types.StringType,
+							Validators: []validator.List{
+								listvalidator.SizeAtLeast(1),
+								listvalidator.ValueStringsAre(stringvalidator.RegexMatches(regexp.MustCompile(`^/`), "must start with /")),
+							},
+						},
+						"service": schema.StringAttribute{
+							MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching requests to, in the same forms accepted by `default_service`.",
+							Required:            true,
+							Validators: []validator.String{
+								stringvalidator.LengthAtLeast(1),
+							},
+						},
+					},
 				},
 			},
 			"description": schema.StringAttribute{
@@ -405,11 +444,36 @@ func planToEntrySpec(ctx context.Context, plan urlMapHostRuleModel) (entrySpec, 
 	if diags.HasError() {
 		return entrySpec{}, diags
 	}
+
+	// Null/unknown path_rules leaves spec.PathRules nil so the splice
+	// helper writes a bare path matcher (and clears any prior rules).
+	var pathRules []pathRuleSpec
+	if !plan.PathRules.IsNull() && !plan.PathRules.IsUnknown() {
+		var models []pathRuleModel
+		diags.Append(plan.PathRules.ElementsAs(ctx, &models, false)...)
+		if diags.HasError() {
+			return entrySpec{}, diags
+		}
+		pathRules = make([]pathRuleSpec, 0, len(models))
+		for _, pm := range models {
+			var paths []string
+			diags.Append(pm.Paths.ElementsAs(ctx, &paths, false)...)
+			if diags.HasError() {
+				return entrySpec{}, diags
+			}
+			pathRules = append(pathRules, pathRuleSpec{
+				Paths:   paths,
+				Service: pm.Service.ValueString(),
+			})
+		}
+	}
+
 	return entrySpec{
 		Name:           plan.Name.ValueString(),
 		Hosts:          hosts,
 		DefaultService: plan.DefaultService.ValueString(),
 		Description:    plan.Description.ValueString(),
+		PathRules:      pathRules,
 	}, diags
 }
 
@@ -445,6 +509,34 @@ func updateStateFromURLMap(ctx context.Context, m *urlMapHostRuleModel, ref urlM
 		m.Description = types.StringNull()
 	} else {
 		m.Description = types.StringValue(entry.Description)
+	}
+
+	// Null-preservation: when the API reports no path rules and the
+	// incoming model has path_rules null (config never set it), keep it
+	// null so we neither perma-diff nor trip "inconsistent result after
+	// apply". An explicitly-configured empty list round-trips as an
+	// empty list.
+	if len(entry.PathRules) == 0 && m.PathRules.IsNull() {
+		m.PathRules = types.ListNull(pathRuleObjectType())
+	} else {
+		models := make([]pathRuleModel, 0, len(entry.PathRules))
+		for _, r := range entry.PathRules {
+			paths, pathsDiag := types.ListValueFrom(ctx, types.StringType, r.Paths)
+			diags.Append(pathsDiag...)
+			if pathsDiag.HasError() {
+				return diags
+			}
+			models = append(models, pathRuleModel{
+				Paths:   paths,
+				Service: types.StringValue(r.Service),
+			})
+		}
+		pathRules, pathRulesDiag := types.ListValueFrom(ctx, pathRuleObjectType(), models)
+		diags.Append(pathRulesDiag...)
+		if pathRulesDiag.HasError() {
+			return diags
+		}
+		m.PathRules = pathRules
 	}
 	return diags
 }

@@ -93,6 +93,59 @@ func TestAccURLMapHostRule_twoEntries(t *testing.T) {
 	})
 }
 
+// TestAccURLMapHostRule_pathRules exercises the optional path_rules
+// attribute: Create with one rule, Update the rule's path list, then
+// remove path_rules entirely. The rule's service reuses the same backend
+// as default_service — routing /api/* to the same backend is valid and
+// avoids provisioning a second backend just for the test.
+func TestAccURLMapHostRule_pathRules(t *testing.T) {
+	name := fmt.Sprintf("crugcp-acc-%s", strings.ToLower(acctest.RandString(8)))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: protoV6ProviderFactories,
+		CheckDestroy:             testAccCheckURLMapEntryDestroyed(name),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPathRulesConfig(name, []string{"/api/*"}, true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "name", name),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.#", "1"),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.#", "1"),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.0", "/api/*"),
+					resource.TestCheckResourceAttrSet("crugcp_compute_url_map_host_rule.test", "path_rules.0.service"),
+					testAccCheckURLMapEntryExists(name),
+				),
+			},
+			{
+				ResourceName:      "crugcp_compute_url_map_host_rule.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateIdFunc: importIDFunc("crugcp_compute_url_map_host_rule.test"),
+			},
+			{
+				// Extend the path list to exercise the update path.
+				Config: testAccPathRulesConfig(name, []string{"/api", "/api/*"}, true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.#", "1"),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.#", "2"),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.0", "/api"),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.1", "/api/*"),
+					testAccCheckURLMapEntryExists(name),
+				),
+			},
+			{
+				// Drop path_rules entirely; the rules should clear.
+				Config: testAccPathRulesConfig(name, nil, false),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.#", "0"),
+					testAccCheckURLMapEntryExists(name),
+				),
+			},
+		},
+	})
+}
+
 // importIDFunc builds the import identifier from the live state: the
 // canonical url_map path plus a trailing /name.
 func importIDFunc(resourceName string) resource.ImportStateIdFunc {
@@ -176,6 +229,46 @@ resource "crugcp_compute_url_map_host_rule" "b" {
 		b,
 		b+".example.test",
 		os.Getenv(envBackendService),
+	)
+}
+
+// testAccPathRulesConfig renders a single entry with an optional
+// path_rules block. The rule's service reuses envBackendService so the
+// test needs only one backend.
+func testAccPathRulesConfig(name string, paths []string, includePathRules bool) string {
+	service := os.Getenv(envBackendService)
+
+	pathRules := ""
+	if includePathRules {
+		quoted := make([]string, 0, len(paths))
+		for _, p := range paths {
+			quoted = append(quoted, fmt.Sprintf("%q", p))
+		}
+		pathRules = fmt.Sprintf(`
+  path_rules = [
+    {
+      paths   = [%s]
+      service = %q
+    },
+  ]
+`, strings.Join(quoted, ", "), service)
+	}
+
+	return fmt.Sprintf(`
+provider "crugcp" {}
+
+resource "crugcp_compute_url_map_host_rule" "test" {
+  url_map         = %[1]q
+  name            = %[2]q
+  hosts           = [%[3]q]
+  default_service = %[4]q
+%[5]s}
+`,
+		os.Getenv(envURLMap),
+		name,
+		name+".example.test",
+		service,
+		pathRules,
 	)
 }
 

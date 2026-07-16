@@ -42,6 +42,13 @@ func canonicalResourcePath(s string) string {
 	return s
 }
 
+// pathRuleSpec mirrors one computepb.PathRule owned by the entry's
+// path matcher: requests matching any of Paths route to Service.
+type pathRuleSpec struct {
+	Paths   []string
+	Service string
+}
+
 // entrySpec is the in-memory representation of a single host-rule /
 // path-matcher pair that this provider owns. One entry maps to exactly
 // one HostRule (Hosts → name) plus one PathMatcher (name) on the
@@ -51,6 +58,7 @@ type entrySpec struct {
 	Hosts          []string
 	DefaultService string
 	Description    string
+	PathRules      []pathRuleSpec
 }
 
 // upsertEntry returns a copy of m with the entry's HostRule and
@@ -78,6 +86,17 @@ func upsertEntry(m *computepb.UrlMap, e entrySpec) *computepb.UrlMap {
 	}
 	if e.Description != "" {
 		pathMatcher.Description = proto.String(e.Description)
+	}
+
+	if len(e.PathRules) > 0 {
+		rules := make([]*computepb.PathRule, 0, len(e.PathRules))
+		for _, r := range e.PathRules {
+			rules = append(rules, &computepb.PathRule{
+				Paths:   append([]string(nil), r.Paths...),
+				Service: proto.String(r.Service),
+			})
+		}
+		pathMatcher.PathRules = rules
 	}
 
 	out.HostRules = replaceHostRule(out.HostRules, e.Name, hostRule)
@@ -131,6 +150,16 @@ func findEntry(m *computepb.UrlMap, name string) (entrySpec, bool) {
 		return entrySpec{}, false
 	}
 
+	// Extract path rules, canonicalising each service exactly like
+	// DefaultService — the API echoes self links here too.
+	var rules []pathRuleSpec
+	for _, r := range matcher.GetPathRules() {
+		rules = append(rules, pathRuleSpec{
+			Paths:   append([]string(nil), r.GetPaths()...),
+			Service: canonicalResourcePath(r.GetService()),
+		})
+	}
+
 	return entrySpec{
 		Name:  name,
 		Hosts: append([]string(nil), host.GetHosts()...),
@@ -145,6 +174,7 @@ func findEntry(m *computepb.UrlMap, name string) (entrySpec, bool) {
 		// so either being present is enough. Surface neither field
 		// being set as an empty string (== absent in state).
 		Description: firstNonEmpty(host.GetDescription(), matcher.GetDescription()),
+		PathRules:   rules,
 	}, true
 }
 

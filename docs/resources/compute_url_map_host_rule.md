@@ -22,6 +22,15 @@ resource "crugcp_compute_url_map_host_rule" "app_stage" {
   hosts           = ["app-stage.gcp.cru.org"]
   default_service = "projects/app-stage-4km3/regions/us-central1/networkEndpointGroups/serverless-neg"
   description     = "App stage"
+
+  # Route /api/* to a second serverless NEG; everything else falls
+  # through to default_service.
+  path_rules = [
+    {
+      paths   = ["/api", "/api/*"]
+      service = "projects/app-stage-4km3/regions/us-central1/networkEndpointGroups/api-neg"
+    },
+  ]
 }
 ```
 
@@ -40,12 +49,21 @@ Self-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.
 ### Optional
 
 - `description` (String) Free-form description written to both the host rule and the path matcher. Optional.
+- `path_rules` (Attributes List) Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins regardless of list order. Patterns must start with `/` and may use `*` only after a final `/` (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`. (see [below for nested schema](#nestedatt--path_rules))
 
 ### Read-Only
 
 - `id` (String) Composite identifier of the form `projects/{project}/global/urlMaps/{url_map}/{name}`.
 - `project` (String) Project parsed from `url_map`. Surfaced for downstream interpolations.
 - `url_map_name` (String) Short name of the URL map parsed from `url_map`.
+
+<a id="nestedatt--path_rules"></a>
+### Nested Schema for `path_rules`
+
+Required:
+
+- `paths` (List of String) Path patterns to match. At least one required; each must start with `/`.
+- `service` (String) Resource path of the backend service or serverless NEG to route matching requests to, in the same forms accepted by `default_service`.
 
 ## Import
 
