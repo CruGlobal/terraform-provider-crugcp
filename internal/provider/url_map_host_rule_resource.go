@@ -12,6 +12,7 @@ import (
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -58,17 +59,17 @@ type urlMapHostRuleModel struct {
 	Hosts          types.List   `tfsdk:"hosts"`
 	DefaultService types.String `tfsdk:"default_service"`
 	Description    types.String `tfsdk:"description"`
-	PathRules      types.List   `tfsdk:"path_rules"`
+	PathRules      types.Set    `tfsdk:"path_rules"`
 }
 
 type pathRuleModel struct {
-	Paths   types.List   `tfsdk:"paths"`
+	Paths   types.Set    `tfsdk:"paths"`
 	Service types.String `tfsdk:"service"`
 }
 
 func pathRuleObjectType() types.ObjectType {
 	return types.ObjectType{AttrTypes: map[string]attr.Type{
-		"paths":   types.ListType{ElemType: types.StringType},
+		"paths":   types.SetType{ElemType: types.StringType},
 		"service": types.StringType,
 	}}
 }
@@ -129,18 +130,21 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 					stringvalidator.LengthAtLeast(1),
 				},
 			},
-			"path_rules": schema.ListNestedAttribute{
-				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins regardless of list order. Patterns must start with `/` and may use `*` only after a final `/` (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.",
+			"path_rules": schema.SetNestedAttribute{
+				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins, so order is not significant — this is an unordered set. Patterns must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.",
 				Optional:            true,
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
-						"paths": schema.ListAttribute{
-							MarkdownDescription: "Path patterns to match. At least one required; each must start with `/`.",
+						"paths": schema.SetAttribute{
+							MarkdownDescription: "Path patterns to match, as an unordered set. At least one required; each must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`).",
 							Required:            true,
 							ElementType:         types.StringType,
-							Validators: []validator.List{
-								listvalidator.SizeAtLeast(1),
-								listvalidator.ValueStringsAre(stringvalidator.RegexMatches(regexp.MustCompile(`^/`), "must start with /")),
+							Validators: []validator.Set{
+								setvalidator.SizeAtLeast(1),
+								setvalidator.ValueStringsAre(stringvalidator.RegexMatches(
+									regexp.MustCompile(`^/[^*]*$|^/([^*]*/)?\*$`),
+									"must start with / and may use * only as a trailing /* segment (e.g. /api or /api/*)",
+								)),
 							},
 						},
 						"service": schema.StringAttribute{
@@ -514,14 +518,20 @@ func updateStateFromURLMap(ctx context.Context, m *urlMapHostRuleModel, ref urlM
 	// Null-preservation: when the API reports no path rules and the
 	// incoming model has path_rules null (config never set it), keep it
 	// null so we neither perma-diff nor trip "inconsistent result after
-	// apply". An explicitly-configured empty list round-trips as an
-	// empty list.
+	// apply". An explicitly-configured empty set round-trips as an
+	// empty set.
+	//
+	// path_rules and the nested paths are modelled as sets because the
+	// Compute API does not guarantee it echoes either back in the order
+	// sent (upstream google_compute_url_map models both as sets for the
+	// same reason). Set comparison is order-independent, so a differing
+	// GET order can't produce a perpetual diff.
 	if len(entry.PathRules) == 0 && m.PathRules.IsNull() {
-		m.PathRules = types.ListNull(pathRuleObjectType())
+		m.PathRules = types.SetNull(pathRuleObjectType())
 	} else {
 		models := make([]pathRuleModel, 0, len(entry.PathRules))
 		for _, r := range entry.PathRules {
-			paths, pathsDiag := types.ListValueFrom(ctx, types.StringType, r.Paths)
+			paths, pathsDiag := types.SetValueFrom(ctx, types.StringType, r.Paths)
 			diags.Append(pathsDiag...)
 			if pathsDiag.HasError() {
 				return diags
@@ -531,7 +541,7 @@ func updateStateFromURLMap(ctx context.Context, m *urlMapHostRuleModel, ref urlM
 				Service: types.StringValue(r.Service),
 			})
 		}
-		pathRules, pathRulesDiag := types.ListValueFrom(ctx, pathRuleObjectType(), models)
+		pathRules, pathRulesDiag := types.SetValueFrom(ctx, pathRuleObjectType(), models)
 		diags.Append(pathRulesDiag...)
 		if pathRulesDiag.HasError() {
 			return diags

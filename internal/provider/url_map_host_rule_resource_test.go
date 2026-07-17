@@ -111,9 +111,16 @@ func TestAccURLMapHostRule_pathRules(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "name", name),
 					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.#", "1"),
-					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.#", "1"),
-					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.0", "/api/*"),
-					resource.TestCheckResourceAttrSet("crugcp_compute_url_map_host_rule.test", "path_rules.0.service"),
+					// path_rules and paths are sets: assert on membership,
+					// not index, so a differing API echo order can't fail
+					// the test spuriously.
+					resource.TestCheckTypeSetElemNestedAttrs("crugcp_compute_url_map_host_rule.test", "path_rules.*", map[string]string{
+						"paths.#": "1",
+					}),
+					// The live URL map is the authoritative check that the
+					// path set round-trips regardless of order — the exact
+					// concern behind modelling these as sets.
+					testAccCheckPathRulePaths(name, "/api/*"),
 					testAccCheckURLMapEntryExists(name),
 				),
 			},
@@ -124,13 +131,14 @@ func TestAccURLMapHostRule_pathRules(t *testing.T) {
 				ImportStateIdFunc: importIDFunc("crugcp_compute_url_map_host_rule.test"),
 			},
 			{
-				// Extend the path list to exercise the update path.
+				// Extend the path set to exercise the update path.
 				Config: testAccPathRulesConfig(name, []string{"/api", "/api/*"}, true),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.#", "1"),
-					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.#", "2"),
-					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.0", "/api"),
-					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "path_rules.0.paths.1", "/api/*"),
+					resource.TestCheckTypeSetElemNestedAttrs("crugcp_compute_url_map_host_rule.test", "path_rules.*", map[string]string{
+						"paths.#": "2",
+					}),
+					testAccCheckPathRulePaths(name, "/api", "/api/*"),
 					testAccCheckURLMapEntryExists(name),
 				),
 			},
@@ -289,6 +297,50 @@ func testAccCheckURLMapEntryExists(name string) resource.TestCheckFunc {
 		}
 		if _, ok := findEntry(got, name); !ok {
 			return fmt.Errorf("entry %q not present in %s", name, ref)
+		}
+		return nil
+	}
+}
+
+// testAccCheckPathRulePaths reads the live URL map and asserts the
+// single path rule's paths match wantPaths as a set — order-independent,
+// which is the whole point of modelling paths as a set. It fails if the
+// live API dropped, reordered into a mismatch, or added paths.
+func testAccCheckPathRulePaths(name string, wantPaths ...string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		ref, err := parseURLMapRef(os.Getenv(envURLMap))
+		if err != nil {
+			return err
+		}
+		got, err := testURLMapsClient.Get(context.Background(), &computepb.GetUrlMapRequest{
+			Project: ref.Project,
+			UrlMap:  ref.Name,
+		})
+		if err != nil {
+			return err
+		}
+		entry, ok := findEntry(got, name)
+		if !ok {
+			return fmt.Errorf("entry %q not present in %s", name, ref)
+		}
+		if len(entry.PathRules) != 1 {
+			return fmt.Errorf("expected exactly one path rule on %q, got %d", name, len(entry.PathRules))
+		}
+		want := make(map[string]struct{}, len(wantPaths))
+		for _, p := range wantPaths {
+			want[p] = struct{}{}
+		}
+		gotPaths := make(map[string]struct{}, len(entry.PathRules[0].Paths))
+		for _, p := range entry.PathRules[0].Paths {
+			gotPaths[p] = struct{}{}
+		}
+		if len(want) != len(gotPaths) {
+			return fmt.Errorf("path set mismatch for %q: want %v, got %v", name, wantPaths, entry.PathRules[0].Paths)
+		}
+		for p := range want {
+			if _, ok := gotPaths[p]; !ok {
+				return fmt.Errorf("path %q missing from %q: got %v", p, name, entry.PathRules[0].Paths)
+			}
 		}
 		return nil
 	}
