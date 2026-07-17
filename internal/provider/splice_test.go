@@ -203,6 +203,163 @@ func TestFindEntry_canonicalisesDefaultService(t *testing.T) {
 	}
 }
 
+// findMatcher returns the raw PathMatcher owned by name, or nil. Tests
+// that assert on the spliced proto (rather than the round-tripped spec)
+// use it to reach the PathMatcher's PathRules directly.
+func findMatcher(m *computepb.UrlMap, name string) *computepb.PathMatcher {
+	for _, p := range m.PathMatchers {
+		if p.GetName() == name {
+			return p
+		}
+	}
+	return nil
+}
+
+func TestUpsertEntry_withPathRules(t *testing.T) {
+	out := upsertEntry(fixtureUrlMap(), entrySpec{
+		Name:           "app-stage",
+		Hosts:          []string{"app-stage.gcp.cru.org"},
+		DefaultService: "projects/app-stage/regions/r/networkEndpointGroups/serverless-neg",
+		PathRules: []pathRuleSpec{
+			{
+				Paths:   []string{"/api", "/api/*"},
+				Service: "projects/app-stage/regions/r/networkEndpointGroups/api-neg",
+			},
+			{
+				Paths:   []string{"/admin/*"},
+				Service: "projects/app-stage/regions/r/networkEndpointGroups/admin-neg",
+			},
+		},
+	})
+
+	matcher := findMatcher(out, "app-stage")
+	if matcher == nil {
+		t.Fatal("path matcher not spliced")
+	}
+	rules := matcher.GetPathRules()
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 path rules, got %d", len(rules))
+	}
+
+	if got := rules[0].GetPaths(); len(got) != 2 || got[0] != "/api" || got[1] != "/api/*" {
+		t.Fatalf("rule 0 paths mismatch: %v", got)
+	}
+	if got := rules[0].GetService(); got != "projects/app-stage/regions/r/networkEndpointGroups/api-neg" {
+		t.Fatalf("rule 0 service mismatch: %q", got)
+	}
+	if got := rules[1].GetPaths(); len(got) != 1 || got[0] != "/admin/*" {
+		t.Fatalf("rule 1 paths mismatch: %v", got)
+	}
+	if got := rules[1].GetService(); got != "projects/app-stage/regions/r/networkEndpointGroups/admin-neg" {
+		t.Fatalf("rule 1 service mismatch: %q", got)
+	}
+}
+
+// TestUpsertEntry_removesPathRulesOnUpdate proves that upserting the same
+// entry without path rules clears any that were present — the matcher is
+// replaced wholesale by replacePathMatcher, so no explicit clear is
+// needed.
+func TestUpsertEntry_removesPathRulesOnUpdate(t *testing.T) {
+	base := upsertEntry(fixtureUrlMap(), entrySpec{
+		Name:           "app-stage",
+		Hosts:          []string{"app-stage.gcp.cru.org"},
+		DefaultService: "projects/app-stage/regions/r/networkEndpointGroups/serverless-neg",
+		PathRules: []pathRuleSpec{
+			{Paths: []string{"/api/*"}, Service: "projects/app-stage/regions/r/networkEndpointGroups/api-neg"},
+		},
+	})
+	if matcher := findMatcher(base, "app-stage"); matcher == nil || len(matcher.GetPathRules()) != 1 {
+		t.Fatalf("setup: expected one path rule before update")
+	}
+
+	out := upsertEntry(base, entrySpec{
+		Name:           "app-stage",
+		Hosts:          []string{"app-stage.gcp.cru.org"},
+		DefaultService: "projects/app-stage/regions/r/networkEndpointGroups/serverless-neg",
+	})
+
+	matcher := findMatcher(out, "app-stage")
+	if matcher == nil {
+		t.Fatal("path matcher missing after update")
+	}
+	if got := matcher.GetPathRules(); len(got) != 0 {
+		t.Fatalf("expected path rules cleared, got %d", len(got))
+	}
+}
+
+// TestFindEntry_extractsPathRules seeds a matcher whose rule service is
+// the self-link form GCP returns and asserts findEntry extracts the
+// rules and canonicalises each service exactly like default_service.
+func TestFindEntry_extractsPathRules(t *testing.T) {
+	m := &computepb.UrlMap{
+		HostRules: []*computepb.HostRule{
+			{Hosts: []string{"app.example.com"}, PathMatcher: proto.String("app")},
+		},
+		PathMatchers: []*computepb.PathMatcher{
+			{
+				Name:           proto.String("app"),
+				DefaultService: proto.String("projects/p/global/backendServices/b"),
+				PathRules: []*computepb.PathRule{
+					{
+						Paths:   []string{"/api", "/api/*"},
+						Service: proto.String("https://www.googleapis.com/compute/v1/projects/p/regions/r/networkEndpointGroups/api-neg"),
+					},
+				},
+			},
+		},
+	}
+
+	got, ok := findEntry(m, "app")
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if len(got.PathRules) != 1 {
+		t.Fatalf("expected 1 path rule, got %d", len(got.PathRules))
+	}
+	if paths := got.PathRules[0].Paths; len(paths) != 2 || paths[0] != "/api" || paths[1] != "/api/*" {
+		t.Fatalf("paths mismatch: %v", paths)
+	}
+	if svc := got.PathRules[0].Service; svc != "projects/p/regions/r/networkEndpointGroups/api-neg" {
+		t.Fatalf("path rule service not canonicalised: %q", svc)
+	}
+}
+
+// TestUpsertEntry_pathRulesRoundTrip splices an entry with path rules and
+// reads it back through findEntry, asserting the spec survives intact.
+func TestUpsertEntry_pathRulesRoundTrip(t *testing.T) {
+	in := entrySpec{
+		Name:           "app-stage",
+		Hosts:          []string{"app-stage.gcp.cru.org"},
+		DefaultService: "projects/app-stage/regions/r/networkEndpointGroups/serverless-neg",
+		PathRules: []pathRuleSpec{
+			{Paths: []string{"/api/*"}, Service: "projects/app-stage/regions/r/networkEndpointGroups/api-neg"},
+			{Paths: []string{"/admin", "/admin/*"}, Service: "projects/app-stage/regions/r/networkEndpointGroups/admin-neg"},
+		},
+	}
+	out := upsertEntry(fixtureUrlMap(), in)
+
+	got, ok := findEntry(out, "app-stage")
+	if !ok {
+		t.Fatal("entry not found after upsert")
+	}
+	if len(got.PathRules) != len(in.PathRules) {
+		t.Fatalf("path rule count mismatch: got %d want %d", len(got.PathRules), len(in.PathRules))
+	}
+	for i := range in.PathRules {
+		if got.PathRules[i].Service != in.PathRules[i].Service {
+			t.Fatalf("rule %d service mismatch: got %q want %q", i, got.PathRules[i].Service, in.PathRules[i].Service)
+		}
+		if len(got.PathRules[i].Paths) != len(in.PathRules[i].Paths) {
+			t.Fatalf("rule %d path count mismatch: %v vs %v", i, got.PathRules[i].Paths, in.PathRules[i].Paths)
+		}
+		for j := range in.PathRules[i].Paths {
+			if got.PathRules[i].Paths[j] != in.PathRules[i].Paths[j] {
+				t.Fatalf("rule %d path %d mismatch: got %q want %q", i, j, got.PathRules[i].Paths[j], in.PathRules[i].Paths[j])
+			}
+		}
+	}
+}
+
 func TestFindEntry_halfSplicedReturnsFalse(t *testing.T) {
 	m := &computepb.UrlMap{
 		HostRules: []*computepb.HostRule{
