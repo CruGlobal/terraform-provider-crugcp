@@ -381,3 +381,261 @@ func TestFindEntry_halfSplicedReturnsFalse(t *testing.T) {
 		t.Fatalf("expected findEntry to reject half-spliced state (matcher only)")
 	}
 }
+
+// signinRouteRules returns the route-rule set from the IAP signin
+// pattern that motivated route_rules support: static signin page, IAP
+// callback + login-button query params, session-cookie sniffing, and a
+// catch-all redirect. It exercises every supported match and action.
+func signinRouteRules() []routeRuleSpec {
+	present := true
+	return []routeRuleSpec{
+		{
+			Priority: 5,
+			Matches:  []routeMatchSpec{{Prefix: "/"}},
+			Redirect: &redirectSpec{Path: "/signin", ResponseCode: "FOUND", StripQuery: false},
+		},
+		{
+			Priority: 1,
+			Matches:  []routeMatchSpec{{Prefix: "/signin"}, {Prefix: "/assets/"}},
+			Service:  "projects/p/global/backendServices/signin-gcs",
+		},
+		{
+			Priority: 4,
+			Matches: []routeMatchSpec{{
+				Prefix:  "/",
+				Headers: []headerMatchSpec{{Name: "Cookie", Regex: ".*GCP_IAA?P_AUTH_TOKEN.*"}},
+			}},
+			Service: "projects/p/regions/r/networkEndpointGroups/app-neg",
+		},
+		{
+			Priority: 2,
+			Matches: []routeMatchSpec{{
+				Prefix:      "/",
+				QueryParams: []queryParamMatchSpec{{Name: "gcp-iap-mode", Present: &present}},
+			}},
+			Service: "projects/p/regions/r/networkEndpointGroups/app-neg",
+		},
+		{
+			Priority: 3,
+			Matches: []routeMatchSpec{{
+				FullPath:    "/",
+				QueryParams: []queryParamMatchSpec{{Name: "login", Exact: "1"}},
+			}},
+			Service: "projects/p/regions/r/networkEndpointGroups/app-neg",
+		},
+	}
+}
+
+// TestUpsertEntry_withRouteRules asserts the spliced proto: rules land
+// on RouteRules sorted by priority, PathRules stays empty, and unset
+// optional fields stay nil rather than becoming empty strings.
+func TestUpsertEntry_withRouteRules(t *testing.T) {
+	out := upsertEntry(fixtureUrlMap(), entrySpec{
+		Name:       "app-stage",
+		Hosts:      []string{"app-stage.gcp.cru.org"},
+		RouteRules: signinRouteRules(),
+	})
+
+	matcher := findMatcher(out, "app-stage")
+	if matcher == nil {
+		t.Fatal("path matcher not spliced")
+	}
+	if matcher.DefaultService != nil {
+		t.Fatalf("default service should be unset, got %q", matcher.GetDefaultService())
+	}
+	if len(matcher.GetPathRules()) != 0 {
+		t.Fatalf("path rules should be empty, got %d", len(matcher.GetPathRules()))
+	}
+
+	rules := matcher.GetRouteRules()
+	if len(rules) != 5 {
+		t.Fatalf("expected 5 route rules, got %d", len(rules))
+	}
+	for i, r := range rules {
+		if got := r.GetPriority(); got != int32(i+1) {
+			t.Fatalf("rules not sorted by priority: rule %d has priority %d", i, got)
+		}
+	}
+
+	// Rule 1: two prefix matches, plain service.
+	if got := len(rules[0].GetMatchRules()); got != 2 {
+		t.Fatalf("rule priority 1: expected 2 match rules, got %d", got)
+	}
+	if got := rules[0].GetService(); got != "projects/p/global/backendServices/signin-gcs" {
+		t.Fatalf("rule priority 1 service mismatch: %q", got)
+	}
+	if rules[0].UrlRedirect != nil {
+		t.Fatal("rule priority 1 should not have a redirect")
+	}
+
+	// Rule 2: query param present match; exact stays nil.
+	qp := rules[1].GetMatchRules()[0].GetQueryParameterMatches()
+	if len(qp) != 1 || qp[0].GetName() != "gcp-iap-mode" {
+		t.Fatalf("rule priority 2 query param mismatch: %v", qp)
+	}
+	if qp[0].PresentMatch == nil || !qp[0].GetPresentMatch() {
+		t.Fatal("rule priority 2 presentMatch should be true")
+	}
+	if qp[0].ExactMatch != nil {
+		t.Fatal("rule priority 2 exactMatch should be unset")
+	}
+
+	// Rule 3: full-path match with exact query param; prefix stays nil.
+	m3 := rules[2].GetMatchRules()[0]
+	if m3.PrefixMatch != nil || m3.GetFullPathMatch() != "/" {
+		t.Fatalf("rule priority 3 path match mismatch: prefix=%v full=%q", m3.PrefixMatch, m3.GetFullPathMatch())
+	}
+	if got := m3.GetQueryParameterMatches()[0].GetExactMatch(); got != "1" {
+		t.Fatalf("rule priority 3 exactMatch mismatch: %q", got)
+	}
+
+	// Rule 4: header regex match; presentMatch stays nil.
+	hm := rules[3].GetMatchRules()[0].GetHeaderMatches()
+	if len(hm) != 1 || hm[0].GetHeaderName() != "Cookie" || hm[0].GetRegexMatch() != ".*GCP_IAA?P_AUTH_TOKEN.*" {
+		t.Fatalf("rule priority 4 header match mismatch: %v", hm)
+	}
+	if hm[0].PresentMatch != nil {
+		t.Fatal("rule priority 4 presentMatch should be unset")
+	}
+
+	// Rule 5: redirect, no service.
+	if rules[4].Service != nil {
+		t.Fatal("rule priority 5 should not have a service")
+	}
+	rd := rules[4].GetUrlRedirect()
+	if rd.GetPathRedirect() != "/signin" || rd.GetRedirectResponseCode() != "FOUND" || rd.GetStripQuery() {
+		t.Fatalf("rule priority 5 redirect mismatch: %v", rd)
+	}
+}
+
+// TestUpsertEntry_routeRulesRoundTrip splices the signin rules and
+// reads them back through findEntry, asserting the specs survive
+// intact (modulo priority sorting, which upsert applies).
+func TestUpsertEntry_routeRulesRoundTrip(t *testing.T) {
+	in := signinRouteRules()
+	out := upsertEntry(fixtureUrlMap(), entrySpec{
+		Name:       "app-stage",
+		Hosts:      []string{"app-stage.gcp.cru.org"},
+		RouteRules: in,
+	})
+
+	got, ok := findEntry(out, "app-stage")
+	if !ok {
+		t.Fatal("entry not found after upsert")
+	}
+	if got.DefaultService != "" {
+		t.Fatalf("default service should be empty, got %q", got.DefaultService)
+	}
+	if len(got.RouteRules) != len(in) {
+		t.Fatalf("route rule count mismatch: got %d want %d", len(got.RouteRules), len(in))
+	}
+
+	byPriority := make(map[int32]routeRuleSpec, len(in))
+	for _, r := range in {
+		byPriority[r.Priority] = r
+	}
+	for _, gotRule := range got.RouteRules {
+		want := byPriority[gotRule.Priority]
+		if gotRule.Service != want.Service {
+			t.Fatalf("priority %d service mismatch: got %q want %q", gotRule.Priority, gotRule.Service, want.Service)
+		}
+		if (gotRule.Redirect == nil) != (want.Redirect == nil) {
+			t.Fatalf("priority %d redirect presence mismatch", gotRule.Priority)
+		}
+		if want.Redirect != nil && *gotRule.Redirect != *want.Redirect {
+			t.Fatalf("priority %d redirect mismatch: got %+v want %+v", gotRule.Priority, *gotRule.Redirect, *want.Redirect)
+		}
+		if len(gotRule.Matches) != len(want.Matches) {
+			t.Fatalf("priority %d match count mismatch: got %d want %d", gotRule.Priority, len(gotRule.Matches), len(want.Matches))
+		}
+		for i, gm := range gotRule.Matches {
+			wm := want.Matches[i]
+			if gm.Prefix != wm.Prefix || gm.FullPath != wm.FullPath {
+				t.Fatalf("priority %d match %d path mismatch: got %+v want %+v", gotRule.Priority, i, gm, wm)
+			}
+			if len(gm.Headers) != len(wm.Headers) || len(gm.QueryParams) != len(wm.QueryParams) {
+				t.Fatalf("priority %d match %d criteria count mismatch: got %+v want %+v", gotRule.Priority, i, gm, wm)
+			}
+			for j := range wm.Headers {
+				if gm.Headers[j].Name != wm.Headers[j].Name || gm.Headers[j].Regex != wm.Headers[j].Regex {
+					t.Fatalf("priority %d header mismatch: got %+v want %+v", gotRule.Priority, gm.Headers[j], wm.Headers[j])
+				}
+				if (gm.Headers[j].Present == nil) != (wm.Headers[j].Present == nil) {
+					t.Fatalf("priority %d header present-ness mismatch", gotRule.Priority)
+				}
+			}
+			for j := range wm.QueryParams {
+				gq, wq := gm.QueryParams[j], wm.QueryParams[j]
+				if gq.Name != wq.Name || gq.Exact != wq.Exact {
+					t.Fatalf("priority %d query param mismatch: got %+v want %+v", gotRule.Priority, gq, wq)
+				}
+				if (gq.Present == nil) != (wq.Present == nil) || (gq.Present != nil && *gq.Present != *wq.Present) {
+					t.Fatalf("priority %d query param present mismatch", gotRule.Priority)
+				}
+			}
+		}
+	}
+}
+
+// TestFindEntry_canonicalisesRouteRuleService seeds a route rule whose
+// service is the self-link form GCP echoes and asserts findEntry hands
+// back the canonical short form, matching default_service behaviour.
+func TestFindEntry_canonicalisesRouteRuleService(t *testing.T) {
+	m := &computepb.UrlMap{
+		HostRules: []*computepb.HostRule{
+			{Hosts: []string{"app.example.com"}, PathMatcher: proto.String("app")},
+		},
+		PathMatchers: []*computepb.PathMatcher{
+			{
+				Name: proto.String("app"),
+				RouteRules: []*computepb.HttpRouteRule{
+					{
+						Priority:   proto.Int32(1),
+						MatchRules: []*computepb.HttpRouteRuleMatch{{PrefixMatch: proto.String("/")}},
+						Service:    proto.String("https://www.googleapis.com/compute/v1/projects/p/global/backendServices/b"),
+					},
+				},
+			},
+		},
+	}
+	got, ok := findEntry(m, "app")
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if got.DefaultService != "" {
+		t.Fatalf("expected empty default service, got %q", got.DefaultService)
+	}
+	if len(got.RouteRules) != 1 || got.RouteRules[0].Service != "projects/p/global/backendServices/b" {
+		t.Fatalf("route rule service not canonicalised: %+v", got.RouteRules)
+	}
+}
+
+// TestUpsertEntry_removesRouteRulesOnUpdate mirrors the path-rules
+// clearing test: replacing the entry without route rules drops them.
+func TestUpsertEntry_removesRouteRulesOnUpdate(t *testing.T) {
+	base := upsertEntry(fixtureUrlMap(), entrySpec{
+		Name:       "app-stage",
+		Hosts:      []string{"app-stage.gcp.cru.org"},
+		RouteRules: signinRouteRules(),
+	})
+	if matcher := findMatcher(base, "app-stage"); matcher == nil || len(matcher.GetRouteRules()) != 5 {
+		t.Fatal("setup: expected five route rules before update")
+	}
+
+	out := upsertEntry(base, entrySpec{
+		Name:           "app-stage",
+		Hosts:          []string{"app-stage.gcp.cru.org"},
+		DefaultService: "projects/app-stage/regions/r/networkEndpointGroups/serverless-neg",
+	})
+
+	matcher := findMatcher(out, "app-stage")
+	if matcher == nil {
+		t.Fatal("path matcher missing after update")
+	}
+	if got := matcher.GetRouteRules(); len(got) != 0 {
+		t.Fatalf("expected route rules cleared, got %d", len(got))
+	}
+	if got := matcher.GetDefaultService(); got != "projects/app-stage/regions/r/networkEndpointGroups/serverless-neg" {
+		t.Fatalf("default service mismatch after update: %q", got)
+	}
+}
