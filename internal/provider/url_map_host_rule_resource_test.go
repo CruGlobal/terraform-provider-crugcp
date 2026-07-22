@@ -154,6 +154,186 @@ func TestAccURLMapHostRule_pathRules(t *testing.T) {
 	})
 }
 
+// TestAccURLMapHostRule_routeRules exercises route_rules end to end
+// with the IAP-signin shape that motivated the feature: prefix
+// matches, a query-param present match, a Cookie-header regex match,
+// and a catch-all redirect — with no default_service. It then updates
+// the redirect's response code and finally swaps back to a plain
+// default_service entry, proving the rules clear.
+//
+// The parent URL map must use load_balancing_scheme EXTERNAL_MANAGED —
+// classic Application Load Balancers reject routeRules.
+func TestAccURLMapHostRule_routeRules(t *testing.T) {
+	name := fmt.Sprintf("crugcp-acc-%s", strings.ToLower(acctest.RandString(8)))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: protoV6ProviderFactories,
+		CheckDestroy:             testAccCheckURLMapEntryDestroyed(name),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccRouteRulesConfig(name, "FOUND"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "name", name),
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "route_rules.#", "4"),
+					resource.TestCheckNoResourceAttr("crugcp_compute_url_map_host_rule.test", "default_service"),
+					testAccCheckRouteRules(name, "FOUND"),
+					testAccCheckURLMapEntryExists(name),
+				),
+			},
+			{
+				ResourceName:      "crugcp_compute_url_map_host_rule.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateIdFunc: importIDFunc("crugcp_compute_url_map_host_rule.test"),
+			},
+			{
+				// Change the redirect's response code to exercise the
+				// update path through the route-rule splice.
+				Config: testAccRouteRulesConfig(name, "SEE_OTHER"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckRouteRules(name, "SEE_OTHER"),
+					testAccCheckURLMapEntryExists(name),
+				),
+			},
+			{
+				// Swap back to a plain default_service entry; the route
+				// rules should clear.
+				Config: testAccBasicConfig(name, "default", false),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "route_rules.#", "0"),
+					testAccCheckRouteRulesAbsent(name),
+					testAccCheckURLMapEntryExists(name),
+				),
+			},
+		},
+	})
+}
+
+// testAccRouteRulesConfig renders the signin-pattern entry. Both
+// backends reuse envBackendService — the routing decision, not the
+// destination, is what's under test.
+func testAccRouteRulesConfig(name, redirectCode string) string {
+	return fmt.Sprintf(`
+provider "crugcp" {}
+
+resource "crugcp_compute_url_map_host_rule" "test" {
+  url_map = %[1]q
+  name    = %[2]q
+  hosts   = [%[3]q]
+
+  route_rules = [
+    {
+      priority = 1
+      match    = [{ prefix = "/signin" }, { prefix = "/assets/" }]
+      service  = %[4]q
+    },
+    {
+      priority = 2
+      match = [{
+        prefix       = "/"
+        query_params = [{ name = "gcp-iap-mode", present = true }]
+      }]
+      service = %[4]q
+    },
+    {
+      priority = 3
+      match = [{
+        prefix  = "/"
+        headers = [{ name = "Cookie", regex = ".*GCP_IAA?P_AUTH_TOKEN.*" }]
+      }]
+      service = %[4]q
+    },
+    {
+      priority = 4
+      match    = [{ prefix = "/" }]
+      redirect = {
+        path          = "/signin"
+        response_code = %[5]q
+        strip_query   = false
+      }
+    },
+  ]
+}
+`,
+		os.Getenv(envURLMap),
+		name,
+		name+".example.test",
+		os.Getenv(envBackendService),
+		redirectCode,
+	)
+}
+
+// testAccCheckRouteRules asserts against the live URL map that the
+// four signin-pattern rules survived the apply with their match
+// criteria and the expected redirect response code.
+func testAccCheckRouteRules(name, redirectCode string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		entry, err := fetchLiveEntry(name)
+		if err != nil {
+			return err
+		}
+		if len(entry.RouteRules) != 4 {
+			return fmt.Errorf("expected 4 route rules on %q, got %d", name, len(entry.RouteRules))
+		}
+		byPriority := make(map[int32]routeRuleSpec, len(entry.RouteRules))
+		for _, r := range entry.RouteRules {
+			byPriority[r.Priority] = r
+		}
+		if r := byPriority[1]; len(r.Matches) != 2 || r.Service == "" {
+			return fmt.Errorf("priority 1 rule mismatch: %+v", r)
+		}
+		if r := byPriority[2]; len(r.Matches) != 1 || len(r.Matches[0].QueryParams) != 1 ||
+			r.Matches[0].QueryParams[0].Name != "gcp-iap-mode" ||
+			r.Matches[0].QueryParams[0].Present == nil || !*r.Matches[0].QueryParams[0].Present {
+			return fmt.Errorf("priority 2 rule mismatch: %+v", r)
+		}
+		if r := byPriority[3]; len(r.Matches) != 1 || len(r.Matches[0].Headers) != 1 ||
+			r.Matches[0].Headers[0].Name != "Cookie" ||
+			r.Matches[0].Headers[0].Regex != ".*GCP_IAA?P_AUTH_TOKEN.*" {
+			return fmt.Errorf("priority 3 rule mismatch: %+v", r)
+		}
+		if r := byPriority[4]; r.Redirect == nil || r.Redirect.Path != "/signin" ||
+			r.Redirect.ResponseCode != redirectCode || r.Redirect.StripQuery {
+			return fmt.Errorf("priority 4 rule mismatch: %+v", r)
+		}
+		return nil
+	}
+}
+
+func testAccCheckRouteRulesAbsent(name string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		entry, err := fetchLiveEntry(name)
+		if err != nil {
+			return err
+		}
+		if len(entry.RouteRules) != 0 {
+			return fmt.Errorf("expected route rules cleared on %q, got %d", name, len(entry.RouteRules))
+		}
+		return nil
+	}
+}
+
+// fetchLiveEntry reads the entry's spec from the live URL map.
+func fetchLiveEntry(name string) (entrySpec, error) {
+	ref, err := parseURLMapRef(os.Getenv(envURLMap))
+	if err != nil {
+		return entrySpec{}, err
+	}
+	got, err := testURLMapsClient.Get(context.Background(), &computepb.GetUrlMapRequest{
+		Project: ref.Project,
+		UrlMap:  ref.Name,
+	})
+	if err != nil {
+		return entrySpec{}, err
+	}
+	entry, ok := findEntry(got, name)
+	if !ok {
+		return entrySpec{}, fmt.Errorf("entry %q not present in %s", name, ref)
+	}
+	return entry, nil
+}
+
 // importIDFunc builds the import identifier from the live state: the
 // canonical url_map path plus a trailing /name.
 func importIDFunc(resourceName string) resource.ImportStateIdFunc {
