@@ -18,7 +18,10 @@ register a single host rule on a map that another configuration owns.
 This provider fills that gap, modelled on the same split Google uses
 for `google_certificate_manager_certificate_map` (the container) and
 `google_certificate_manager_certificate_map_entry` (individual
-entries).
+entries). Upstream feature requests tracking this gap:
+[hashicorp/terraform-provider-google#13940](https://github.com/hashicorp/terraform-provider-google/issues/13940)
+and
+[hashicorp/terraform-provider-google#8662](https://github.com/hashicorp/terraform-provider-google/issues/8662).
 
 The typical use case is amortising the fixed cost of a Global External
 ALB across many low-traffic internal apps that each live in their own
