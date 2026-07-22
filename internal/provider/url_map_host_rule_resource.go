@@ -201,19 +201,15 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 				},
 			},
 			"default_service": schema.StringAttribute{
-				MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.\n\nSelf-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.\n\nOptional when `route_rules` handles all traffic itself (e.g. a catch-all rule); required with `path_rules`, whose unmatched requests fall through to it. At least one of `default_service` or `route_rules` must be set.",
-				Optional:            true,
+				MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.\n\nSelf-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.\n\nRequired even when `route_rules` covers all traffic — the Compute API rejects a path matcher without a default backend service.",
+				Required:            true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(1),
-					stringvalidator.AtLeastOneOf(path.MatchRoot("route_rules")),
 				},
 			},
 			"path_rules": schema.SetNestedAttribute{
-				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins, so order is not significant — this is an unordered set. Patterns must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.\n\nMutually exclusive with `route_rules` — a GCP path matcher accepts one or the other, never both. Requires `default_service`.",
+				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins, so order is not significant — this is an unordered set. Patterns must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.\n\nMutually exclusive with `route_rules` — a GCP path matcher accepts one or the other, never both.",
 				Optional:            true,
-				Validators: []validator.Set{
-					setvalidator.AlsoRequires(path.MatchRoot("default_service")),
-				},
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"paths": schema.SetAttribute{
@@ -239,7 +235,7 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 				},
 			},
 			"route_rules": schema.SetNestedAttribute{
-				MarkdownDescription: "Advanced route rules on this entry's path matcher — required for matching on headers or query parameters (e.g. routing on the presence of an IAP session cookie) and for URL redirects. Mutually exclusive with `path_rules`: a GCP path matcher accepts one or the other, never both.\n\nRules are evaluated in ascending `priority` order and the first match wins — an unordered set with explicit priorities, so config order is not significant. Requests matching none of the rules fall through to `default_service` (if set).\n\nOnly supported on `EXTERNAL_MANAGED` (and `INTERNAL_MANAGED`) load balancers — classic Application Load Balancers reject route rules.",
+				MarkdownDescription: "Advanced route rules on this entry's path matcher — required for matching on headers or query parameters (e.g. routing on the presence of an IAP session cookie) and for URL redirects. Mutually exclusive with `path_rules`: a GCP path matcher accepts one or the other, never both.\n\nRules are evaluated in ascending `priority` order and the first match wins — an unordered set with explicit priorities, so config order is not significant. Requests matching none of the rules fall through to `default_service`.\n\nOnly supported on `EXTERNAL_MANAGED` (and `INTERNAL_MANAGED`) load balancers — classic Application Load Balancers reject route rules.",
 				Optional:            true,
 				Validators: []validator.Set{
 					setvalidator.ConflictsWith(path.MatchRoot("path_rules")),

@@ -44,6 +44,10 @@ resource "crugcp_compute_url_map_host_rule" "app_prod" {
   name    = "app-prod"
   hosts   = ["app.gcp.cru.org"]
 
+  # Required by GCP even though the catch-all rule below means it is
+  # never consulted.
+  default_service = "projects/app-prod-4km3/regions/us-central1/networkEndpointGroups/serverless-neg"
+
   route_rules = [
     {
       # Public sign-in page and its assets, served from a GCS backend.
@@ -101,24 +105,24 @@ resource "crugcp_compute_url_map_host_rule" "app_prod" {
 
 ### Required
 
+- `default_service` (String) Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.
+
+Self-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.
+
+Required even when `route_rules` covers all traffic — the Compute API rejects a path matcher without a default backend service.
 - `hosts` (List of String) Hostnames whose requests should be routed to `default_service`. At least one required.
 - `name` (String) Unique name for this entry within the URL map. Used as both `host_rule.path_matcher` (the cross-reference) and `path_matcher.name`. Forces replacement on change.
 - `url_map` (String) The global Compute URL map to splice into. Accepts the canonical resource path `projects/{project}/global/urlMaps/{name}` or the equivalent self link. Forces replacement on change — moving an entry between URL maps is destroy-and-recreate.
 
 ### Optional
 
-- `default_service` (String) Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.
-
-Self-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.
-
-Optional when `route_rules` handles all traffic itself (e.g. a catch-all rule); required with `path_rules`, whose unmatched requests fall through to it. At least one of `default_service` or `route_rules` must be set.
 - `description` (String) Free-form description written to both the host rule and the path matcher. Optional.
 - `path_rules` (Attributes Set) Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins, so order is not significant — this is an unordered set. Patterns must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.
 
-Mutually exclusive with `route_rules` — a GCP path matcher accepts one or the other, never both. Requires `default_service`. (see [below for nested schema](#nestedatt--path_rules))
+Mutually exclusive with `route_rules` — a GCP path matcher accepts one or the other, never both. (see [below for nested schema](#nestedatt--path_rules))
 - `route_rules` (Attributes Set) Advanced route rules on this entry's path matcher — required for matching on headers or query parameters (e.g. routing on the presence of an IAP session cookie) and for URL redirects. Mutually exclusive with `path_rules`: a GCP path matcher accepts one or the other, never both.
 
-Rules are evaluated in ascending `priority` order and the first match wins — an unordered set with explicit priorities, so config order is not significant. Requests matching none of the rules fall through to `default_service` (if set).
+Rules are evaluated in ascending `priority` order and the first match wins — an unordered set with explicit priorities, so config order is not significant. Requests matching none of the rules fall through to `default_service`.
 
 Only supported on `EXTERNAL_MANAGED` (and `INTERNAL_MANAGED`) load balancers — classic Application Load Balancers reject route rules. (see [below for nested schema](#nestedatt--route_rules))
 

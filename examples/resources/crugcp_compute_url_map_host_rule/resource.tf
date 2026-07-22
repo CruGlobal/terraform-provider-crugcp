@@ -26,6 +26,10 @@ resource "crugcp_compute_url_map_host_rule" "app_prod" {
   name    = "app-prod"
   hosts   = ["app.gcp.cru.org"]
 
+  # Required by GCP even though the catch-all rule below means it is
+  # never consulted.
+  default_service = "projects/app-prod-4km3/regions/us-central1/networkEndpointGroups/serverless-neg"
+
   route_rules = [
     {
       # Public sign-in page and its assets, served from a GCS backend.

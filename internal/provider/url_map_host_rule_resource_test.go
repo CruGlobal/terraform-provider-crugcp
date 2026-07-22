@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -176,7 +177,6 @@ func TestAccURLMapHostRule_routeRules(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "name", name),
 					resource.TestCheckResourceAttr("crugcp_compute_url_map_host_rule.test", "route_rules.#", "4"),
-					resource.TestCheckNoResourceAttr("crugcp_compute_url_map_host_rule.test", "default_service"),
 					testAccCheckRouteRules(name, "FOUND"),
 					testAccCheckURLMapEntryExists(name),
 				),
@@ -210,6 +210,65 @@ func TestAccURLMapHostRule_routeRules(t *testing.T) {
 	})
 }
 
+// Optional envs for the classic-LB error-path test: a URL map whose
+// backends use the classic EXTERNAL scheme, plus a backend service on
+// it. Classic ALBs reject routeRules; the test proves the API error
+// surfaces cleanly. Skipped when unset.
+const (
+	envClassicURLMap         = "CRUGCP_ACC_CLASSIC_URL_MAP"
+	envClassicBackendService = "CRUGCP_ACC_CLASSIC_BACKEND_SERVICE"
+)
+
+// TestAccURLMapHostRule_routeRulesClassicRejected asserts the
+// documented limitation: applying route_rules against a classic
+// (non-EXTERNAL_MANAGED) URL map fails with the API's error rather
+// than something confusing. Empirically the API tolerates a plain
+// prefix-match route rule on an unattached classic map — it is the
+// advanced criteria (the header regex here) that trigger rejection,
+// which is also the feature route_rules exists for.
+func TestAccURLMapHostRule_routeRulesClassicRejected(t *testing.T) {
+	if os.Getenv(envClassicURLMap) == "" || os.Getenv(envClassicBackendService) == "" {
+		t.Skipf("%s and %s must be set for the classic error-path test", envClassicURLMap, envClassicBackendService)
+	}
+	name := fmt.Sprintf("crugcp-acc-%s", strings.ToLower(acctest.RandString(8)))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: protoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+provider "crugcp" {}
+
+resource "crugcp_compute_url_map_host_rule" "test" {
+  url_map         = %[1]q
+  name            = %[2]q
+  hosts           = [%[3]q]
+  default_service = %[4]q
+
+  route_rules = [
+    {
+      priority = 1
+      match = [{
+        prefix  = "/"
+        headers = [{ name = "Cookie", regex = ".*GCP_IAA?P_AUTH_TOKEN.*" }]
+      }]
+      service = %[4]q
+    },
+  ]
+}
+`,
+					os.Getenv(envClassicURLMap),
+					name,
+					name+".example.test",
+					os.Getenv(envClassicBackendService),
+				),
+				ExpectError: regexp.MustCompile(`(?i)route ?rules`),
+			},
+		},
+	})
+}
+
 // testAccRouteRulesConfig renders the signin-pattern entry. Both
 // backends reuse envBackendService — the routing decision, not the
 // destination, is what's under test.
@@ -218,9 +277,10 @@ func testAccRouteRulesConfig(name, redirectCode string) string {
 provider "crugcp" {}
 
 resource "crugcp_compute_url_map_host_rule" "test" {
-  url_map = %[1]q
-  name    = %[2]q
-  hosts   = [%[3]q]
+  url_map         = %[1]q
+  name            = %[2]q
+  hosts           = [%[3]q]
+  default_service = %[4]q
 
   route_rules = [
     {
