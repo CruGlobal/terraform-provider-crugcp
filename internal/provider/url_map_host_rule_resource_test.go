@@ -158,9 +158,9 @@ func TestAccURLMapHostRule_pathRules(t *testing.T) {
 // TestAccURLMapHostRule_routeRules exercises route_rules end to end
 // with the IAP-signin shape that motivated the feature: prefix
 // matches, a query-param present match, a Cookie-header regex match,
-// and a catch-all redirect — with no default_service. It then updates
-// the redirect's response code and finally swaps back to a plain
-// default_service entry, proving the rules clear.
+// and a catch-all redirect. It then updates the redirect's response
+// code and finally swaps back to a plain default_service entry,
+// proving the rules clear.
 //
 // The parent URL map must use load_balancing_scheme EXTERNAL_MANAGED —
 // classic Application Load Balancers reject routeRules.
