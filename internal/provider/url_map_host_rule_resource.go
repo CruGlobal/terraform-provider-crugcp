@@ -11,6 +11,7 @@ import (
 
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/googleapis/gax-go/v2/apierror"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -23,6 +24,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,6 +62,7 @@ type urlMapHostRuleModel struct {
 	DefaultService types.String `tfsdk:"default_service"`
 	Description    types.String `tfsdk:"description"`
 	PathRules      types.Set    `tfsdk:"path_rules"`
+	RouteRules     types.Set    `tfsdk:"route_rules"`
 }
 
 type pathRuleModel struct {
@@ -71,6 +74,80 @@ func pathRuleObjectType() types.ObjectType {
 	return types.ObjectType{AttrTypes: map[string]attr.Type{
 		"paths":   types.SetType{ElemType: types.StringType},
 		"service": types.StringType,
+	}}
+}
+
+type routeRuleModel struct {
+	Priority types.Int64  `tfsdk:"priority"`
+	Match    types.Set    `tfsdk:"match"`
+	Service  types.String `tfsdk:"service"`
+	Redirect types.Object `tfsdk:"redirect"`
+}
+
+type routeMatchModel struct {
+	Prefix      types.String `tfsdk:"prefix"`
+	FullPath    types.String `tfsdk:"full_path"`
+	Headers     types.Set    `tfsdk:"headers"`
+	QueryParams types.Set    `tfsdk:"query_params"`
+}
+
+type headerMatchModel struct {
+	Name    types.String `tfsdk:"name"`
+	Regex   types.String `tfsdk:"regex"`
+	Present types.Bool   `tfsdk:"present"`
+}
+
+type queryParamMatchModel struct {
+	Name    types.String `tfsdk:"name"`
+	Exact   types.String `tfsdk:"exact"`
+	Present types.Bool   `tfsdk:"present"`
+}
+
+type redirectModel struct {
+	Path         types.String `tfsdk:"path"`
+	ResponseCode types.String `tfsdk:"response_code"`
+	StripQuery   types.Bool   `tfsdk:"strip_query"`
+}
+
+func headerMatchObjectType() types.ObjectType {
+	return types.ObjectType{AttrTypes: map[string]attr.Type{
+		"name":    types.StringType,
+		"regex":   types.StringType,
+		"present": types.BoolType,
+	}}
+}
+
+func queryParamMatchObjectType() types.ObjectType {
+	return types.ObjectType{AttrTypes: map[string]attr.Type{
+		"name":    types.StringType,
+		"exact":   types.StringType,
+		"present": types.BoolType,
+	}}
+}
+
+func routeMatchObjectType() types.ObjectType {
+	return types.ObjectType{AttrTypes: map[string]attr.Type{
+		"prefix":       types.StringType,
+		"full_path":    types.StringType,
+		"headers":      types.SetType{ElemType: headerMatchObjectType()},
+		"query_params": types.SetType{ElemType: queryParamMatchObjectType()},
+	}}
+}
+
+func redirectObjectType() types.ObjectType {
+	return types.ObjectType{AttrTypes: map[string]attr.Type{
+		"path":          types.StringType,
+		"response_code": types.StringType,
+		"strip_query":   types.BoolType,
+	}}
+}
+
+func routeRuleObjectType() types.ObjectType {
+	return types.ObjectType{AttrTypes: map[string]attr.Type{
+		"priority": types.Int64Type,
+		"match":    types.SetType{ElemType: routeMatchObjectType()},
+		"service":  types.StringType,
+		"redirect": redirectObjectType(),
 	}}
 }
 
@@ -124,14 +201,14 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 				},
 			},
 			"default_service": schema.StringAttribute{
-				MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.\n\nSelf-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.",
+				MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching traffic to. Example: `projects/app-stage/regions/us-central1/networkEndpointGroups/serverless-neg`.\n\nSelf-link URLs (`https://www.googleapis.com/compute/v1/...` or `https://compute.googleapis.com/compute/v1/...`) are accepted and stored as the canonical short form so plans stay stable across applies.\n\nRequired even when `route_rules` covers all traffic — the Compute API rejects a path matcher without a default backend service.",
 				Required:            true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(1),
 				},
 			},
 			"path_rules": schema.SetNestedAttribute{
-				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins, so order is not significant — this is an unordered set. Patterns must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.",
+				MarkdownDescription: "Path rules on this entry's path matcher. Requests whose path matches any pattern in `paths` route to that rule's `service`; unmatched requests fall through to `default_service`. Per Cloud Load Balancing semantics the most specific path wins, so order is not significant — this is an unordered set. Patterns must start with `/` and may use `*` only as a trailing `/*` segment (e.g. `/api` or `/api/*`). Self-link service URLs are canonicalised the same way as `default_service`.\n\nMutually exclusive with `route_rules` — a GCP path matcher accepts one or the other, never both.",
 				Optional:            true,
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
@@ -152,6 +229,143 @@ func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequ
 							Required:            true,
 							Validators: []validator.String{
 								stringvalidator.LengthAtLeast(1),
+							},
+						},
+					},
+				},
+			},
+			"route_rules": schema.SetNestedAttribute{
+				MarkdownDescription: "Advanced route rules on this entry's path matcher — required for matching on headers or query parameters (e.g. routing on the presence of an IAP session cookie) and for URL redirects. Mutually exclusive with `path_rules`: a GCP path matcher accepts one or the other, never both.\n\nRules are evaluated in ascending `priority` order and the first match wins — an unordered set with explicit priorities, so config order is not significant. Requests matching none of the rules fall through to `default_service`.\n\nOnly supported on `EXTERNAL_MANAGED` (and `INTERNAL_MANAGED`) load balancers — classic Application Load Balancers reject route rules.",
+				Optional:            true,
+				Validators: []validator.Set{
+					setvalidator.ConflictsWith(path.MatchRoot("path_rules")),
+					routeRulePrioritiesUnique{},
+				},
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"priority": schema.Int64Attribute{
+							MarkdownDescription: "Evaluation order: lower numbers are evaluated first and the first matching rule wins. Must be unique within the entry. 0–2147483647.",
+							Required:            true,
+							Validators: []validator.Int64{
+								int64validator.Between(0, 2147483647),
+							},
+						},
+						"match": schema.SetNestedAttribute{
+							MarkdownDescription: "Match conditions for this rule, OR-ed together: the rule fires if any one condition matches. Within a condition, the path match and any `headers` / `query_params` criteria are AND-ed.",
+							Required:            true,
+							Validators: []validator.Set{
+								setvalidator.SizeAtLeast(1),
+							},
+							NestedObject: schema.NestedAttributeObject{
+								Attributes: map[string]schema.Attribute{
+									"prefix": schema.StringAttribute{
+										MarkdownDescription: "Path prefix to match (e.g. `/` or `/signin`). Must start with `/`. Exactly one of `prefix` or `full_path` is required.",
+										Optional:            true,
+										Validators: []validator.String{
+											stringvalidator.RegexMatches(regexp.MustCompile(`^/`), "must start with /"),
+											stringvalidator.ExactlyOneOf(path.MatchRelative().AtParent().AtName("full_path")),
+										},
+									},
+									"full_path": schema.StringAttribute{
+										MarkdownDescription: "Exact path to match, after removing query parameters and anchor. Must start with `/`.",
+										Optional:            true,
+										Validators: []validator.String{
+											stringvalidator.RegexMatches(regexp.MustCompile(`^/`), "must start with /"),
+										},
+									},
+									"headers": schema.SetNestedAttribute{
+										MarkdownDescription: "Header criteria, all of which must match. Header `regex` matching requires an `EXTERNAL_MANAGED` load balancer.",
+										Optional:            true,
+										NestedObject: schema.NestedAttributeObject{
+											Attributes: map[string]schema.Attribute{
+												"name": schema.StringAttribute{
+													MarkdownDescription: "Header name to match (e.g. `Cookie`).",
+													Required:            true,
+													Validators: []validator.String{
+														stringvalidator.LengthAtLeast(1),
+													},
+												},
+												"regex": schema.StringAttribute{
+													MarkdownDescription: "RE2 regular expression the full header value must match (e.g. `.*GCP_IAA?P_AUTH_TOKEN.*`). Exactly one of `regex` or `present` is required.",
+													Optional:            true,
+													Validators: []validator.String{
+														stringvalidator.LengthAtLeast(1),
+														stringvalidator.ExactlyOneOf(path.MatchRelative().AtParent().AtName("present")),
+													},
+												},
+												"present": schema.BoolAttribute{
+													MarkdownDescription: "`true` matches when the header exists regardless of value; `false` matches when it does not exist.",
+													Optional:            true,
+												},
+											},
+										},
+									},
+									"query_params": schema.SetNestedAttribute{
+										MarkdownDescription: "Query parameter criteria, all of which must match.",
+										Optional:            true,
+										NestedObject: schema.NestedAttributeObject{
+											Attributes: map[string]schema.Attribute{
+												"name": schema.StringAttribute{
+													MarkdownDescription: "Query parameter name to match (e.g. `login`).",
+													Required:            true,
+													Validators: []validator.String{
+														stringvalidator.LengthAtLeast(1),
+													},
+												},
+												"exact": schema.StringAttribute{
+													MarkdownDescription: "Value the parameter must equal exactly. Exactly one of `exact` or `present` is required.",
+													Optional:            true,
+													Validators: []validator.String{
+														stringvalidator.LengthAtLeast(1),
+														stringvalidator.ExactlyOneOf(path.MatchRelative().AtParent().AtName("present")),
+													},
+												},
+												"present": schema.BoolAttribute{
+													MarkdownDescription: "`true` matches when the parameter is present in the request, with or without a value.",
+													Optional:            true,
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						"service": schema.StringAttribute{
+							MarkdownDescription: "Resource path of the backend service or serverless NEG to route matching requests to, in the same forms accepted by `default_service`. Exactly one of `service` or `redirect` is required.",
+							Optional:            true,
+							Validators: []validator.String{
+								stringvalidator.LengthAtLeast(1),
+								stringvalidator.ExactlyOneOf(path.MatchRelative().AtParent().AtName("redirect")),
+							},
+						},
+						"redirect": schema.SingleNestedAttribute{
+							MarkdownDescription: "URL redirect to return for matching requests, instead of routing to a backend.",
+							Optional:            true,
+							Attributes: map[string]schema.Attribute{
+								"path": schema.StringAttribute{
+									MarkdownDescription: "Path to redirect to (e.g. `/signin`). Must start with `/`.",
+									Required:            true,
+									Validators: []validator.String{
+										stringvalidator.RegexMatches(regexp.MustCompile(`^/`), "must start with /"),
+									},
+								},
+								"response_code": schema.StringAttribute{
+									MarkdownDescription: "HTTP status of the redirect. One of `MOVED_PERMANENTLY_DEFAULT` (301), `FOUND` (302), `SEE_OTHER` (303), `TEMPORARY_REDIRECT` (307), `PERMANENT_REDIRECT` (308). Required — prefer a temporary code (`FOUND`) for auth-flow redirects, since browsers cache permanent ones aggressively.",
+									Required:            true,
+									Validators: []validator.String{
+										stringvalidator.OneOf(
+											"MOVED_PERMANENTLY_DEFAULT",
+											"FOUND",
+											"SEE_OTHER",
+											"TEMPORARY_REDIRECT",
+											"PERMANENT_REDIRECT",
+										),
+									},
+								},
+								"strip_query": schema.BoolAttribute{
+									MarkdownDescription: "Whether to drop the query string when redirecting.",
+									Required:            true,
+								},
 							},
 						},
 					},
@@ -472,13 +686,240 @@ func planToEntrySpec(ctx context.Context, plan urlMapHostRuleModel) (entrySpec, 
 		}
 	}
 
+	routeRules, routeDiags := routeRulesFromModel(ctx, plan.RouteRules)
+	diags.Append(routeDiags...)
+	if diags.HasError() {
+		return entrySpec{}, diags
+	}
+
 	return entrySpec{
 		Name:           plan.Name.ValueString(),
 		Hosts:          hosts,
 		DefaultService: plan.DefaultService.ValueString(),
 		Description:    plan.Description.ValueString(),
 		PathRules:      pathRules,
+		RouteRules:     routeRules,
 	}, diags
+}
+
+// routeRulesFromModel unpacks the route_rules set into splice specs.
+// A null/unknown set yields nil so the splice helper writes a matcher
+// without route rules (and clears any prior ones).
+func routeRulesFromModel(ctx context.Context, set types.Set) ([]routeRuleSpec, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if set.IsNull() || set.IsUnknown() {
+		return nil, diags
+	}
+
+	var models []routeRuleModel
+	diags.Append(set.ElementsAs(ctx, &models, false)...)
+	if diags.HasError() {
+		return nil, diags
+	}
+
+	rules := make([]routeRuleSpec, 0, len(models))
+	for _, rm := range models {
+		spec := routeRuleSpec{
+			// The schema bounds priority to int32 range.
+			Priority: int32(rm.Priority.ValueInt64()),
+			Service:  rm.Service.ValueString(),
+		}
+
+		var matchModels []routeMatchModel
+		diags.Append(rm.Match.ElementsAs(ctx, &matchModels, false)...)
+		if diags.HasError() {
+			return nil, diags
+		}
+		for _, mm := range matchModels {
+			ms := routeMatchSpec{
+				Prefix:   mm.Prefix.ValueString(),
+				FullPath: mm.FullPath.ValueString(),
+			}
+			if !mm.Headers.IsNull() && !mm.Headers.IsUnknown() {
+				var headerModels []headerMatchModel
+				diags.Append(mm.Headers.ElementsAs(ctx, &headerModels, false)...)
+				if diags.HasError() {
+					return nil, diags
+				}
+				for _, hm := range headerModels {
+					hs := headerMatchSpec{
+						Name:  hm.Name.ValueString(),
+						Regex: hm.Regex.ValueString(),
+					}
+					if !hm.Present.IsNull() {
+						v := hm.Present.ValueBool()
+						hs.Present = &v
+					}
+					ms.Headers = append(ms.Headers, hs)
+				}
+			}
+			if !mm.QueryParams.IsNull() && !mm.QueryParams.IsUnknown() {
+				var paramModels []queryParamMatchModel
+				diags.Append(mm.QueryParams.ElementsAs(ctx, &paramModels, false)...)
+				if diags.HasError() {
+					return nil, diags
+				}
+				for _, qm := range paramModels {
+					qs := queryParamMatchSpec{
+						Name:  qm.Name.ValueString(),
+						Exact: qm.Exact.ValueString(),
+					}
+					if !qm.Present.IsNull() {
+						v := qm.Present.ValueBool()
+						qs.Present = &v
+					}
+					ms.QueryParams = append(ms.QueryParams, qs)
+				}
+			}
+			spec.Matches = append(spec.Matches, ms)
+		}
+
+		if !rm.Redirect.IsNull() && !rm.Redirect.IsUnknown() {
+			var rd redirectModel
+			diags.Append(rm.Redirect.As(ctx, &rd, basetypes.ObjectAsOptions{})...)
+			if diags.HasError() {
+				return nil, diags
+			}
+			spec.Redirect = &redirectSpec{
+				Path:         rd.Path.ValueString(),
+				ResponseCode: rd.ResponseCode.ValueString(),
+				StripQuery:   rd.StripQuery.ValueBool(),
+			}
+		}
+
+		rules = append(rules, spec)
+	}
+	return rules, diags
+}
+
+// routeRulesToValue is the inverse of routeRulesFromModel: it renders
+// splice specs back into the route_rules set for state. Unset optional
+// fields become null (never empty strings) so state matches config.
+func routeRulesToValue(ctx context.Context, rules []routeRuleSpec) (types.Set, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	models := make([]routeRuleModel, 0, len(rules))
+	for _, r := range rules {
+		m := routeRuleModel{
+			Priority: types.Int64Value(int64(r.Priority)),
+			Service:  stringOrNull(r.Service),
+			Redirect: types.ObjectNull(redirectObjectType().AttrTypes),
+		}
+
+		if r.Redirect != nil {
+			obj, objDiags := types.ObjectValueFrom(ctx, redirectObjectType().AttrTypes, redirectModel{
+				Path:         types.StringValue(r.Redirect.Path),
+				ResponseCode: stringOrNull(r.Redirect.ResponseCode),
+				StripQuery:   types.BoolValue(r.Redirect.StripQuery),
+			})
+			diags.Append(objDiags...)
+			if diags.HasError() {
+				return types.SetNull(routeRuleObjectType()), diags
+			}
+			m.Redirect = obj
+		}
+
+		matchModels := make([]routeMatchModel, 0, len(r.Matches))
+		for _, ms := range r.Matches {
+			mm := routeMatchModel{
+				Prefix:      stringOrNull(ms.Prefix),
+				FullPath:    stringOrNull(ms.FullPath),
+				Headers:     types.SetNull(headerMatchObjectType()),
+				QueryParams: types.SetNull(queryParamMatchObjectType()),
+			}
+			if len(ms.Headers) > 0 {
+				headerModels := make([]headerMatchModel, 0, len(ms.Headers))
+				for _, h := range ms.Headers {
+					headerModels = append(headerModels, headerMatchModel{
+						Name:    types.StringValue(h.Name),
+						Regex:   stringOrNull(h.Regex),
+						Present: types.BoolPointerValue(h.Present),
+					})
+				}
+				headers, headersDiags := types.SetValueFrom(ctx, headerMatchObjectType(), headerModels)
+				diags.Append(headersDiags...)
+				if diags.HasError() {
+					return types.SetNull(routeRuleObjectType()), diags
+				}
+				mm.Headers = headers
+			}
+			if len(ms.QueryParams) > 0 {
+				paramModels := make([]queryParamMatchModel, 0, len(ms.QueryParams))
+				for _, q := range ms.QueryParams {
+					paramModels = append(paramModels, queryParamMatchModel{
+						Name:    types.StringValue(q.Name),
+						Exact:   stringOrNull(q.Exact),
+						Present: types.BoolPointerValue(q.Present),
+					})
+				}
+				params, paramsDiags := types.SetValueFrom(ctx, queryParamMatchObjectType(), paramModels)
+				diags.Append(paramsDiags...)
+				if diags.HasError() {
+					return types.SetNull(routeRuleObjectType()), diags
+				}
+				mm.QueryParams = params
+			}
+			matchModels = append(matchModels, mm)
+		}
+		match, matchDiags := types.SetValueFrom(ctx, routeMatchObjectType(), matchModels)
+		diags.Append(matchDiags...)
+		if diags.HasError() {
+			return types.SetNull(routeRuleObjectType()), diags
+		}
+		m.Match = match
+
+		models = append(models, m)
+	}
+
+	set, setDiags := types.SetValueFrom(ctx, routeRuleObjectType(), models)
+	diags.Append(setDiags...)
+	return set, diags
+}
+
+func stringOrNull(s string) types.String {
+	if s == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(s)
+}
+
+// routeRulePrioritiesUnique rejects plans where two route rules share a
+// priority. GCP enforces the same invariant server-side, but its error
+// arrives only at apply time and doesn't point at the offending rules.
+type routeRulePrioritiesUnique struct{}
+
+func (routeRulePrioritiesUnique) Description(context.Context) string {
+	return "route rule priorities must be unique within the entry"
+}
+
+func (v routeRulePrioritiesUnique) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (routeRulePrioritiesUnique) ValidateSet(_ context.Context, req validator.SetRequest, resp *validator.SetResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	seen := make(map[int64]bool)
+	for _, el := range req.ConfigValue.Elements() {
+		obj, ok := el.(types.Object)
+		if !ok {
+			continue
+		}
+		pr, ok := obj.Attributes()["priority"].(types.Int64)
+		if !ok || pr.IsNull() || pr.IsUnknown() {
+			continue
+		}
+		p := pr.ValueInt64()
+		if seen[p] {
+			resp.Diagnostics.AddAttributeError(
+				req.Path,
+				"Duplicate route rule priority",
+				fmt.Sprintf("Priority %d is used by more than one route rule; priorities must be unique within the entry.", p),
+			)
+		}
+		seen[p] = true
+	}
 }
 
 // updateStateFromURLMap copies authoritative values from the latest
@@ -499,7 +940,7 @@ func updateStateFromURLMap(ctx context.Context, m *urlMapHostRuleModel, ref urlM
 	m.Project = types.StringValue(ref.Project)
 	m.URLMapName = types.StringValue(ref.Name)
 	m.Name = types.StringValue(entry.Name)
-	m.DefaultService = types.StringValue(entry.DefaultService)
+	m.DefaultService = stringOrNull(entry.DefaultService)
 	m.ID = types.StringValue(buildID(ref, entry.Name))
 
 	hosts, hostsDiag := types.ListValueFrom(ctx, types.StringType, entry.Hosts)
@@ -547,6 +988,18 @@ func updateStateFromURLMap(ctx context.Context, m *urlMapHostRuleModel, ref urlM
 			return diags
 		}
 		m.PathRules = pathRules
+	}
+
+	// Same null-preservation contract as path_rules.
+	if len(entry.RouteRules) == 0 && m.RouteRules.IsNull() {
+		m.RouteRules = types.SetNull(routeRuleObjectType())
+	} else {
+		routeRules, routeRulesDiag := routeRulesToValue(ctx, entry.RouteRules)
+		diags.Append(routeRulesDiag...)
+		if routeRulesDiag.HasError() {
+			return diags
+		}
+		m.RouteRules = routeRules
 	}
 	return diags
 }

@@ -9,6 +9,7 @@
 package provider
 
 import (
+	"sort"
 	"strings"
 
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
@@ -49,16 +50,68 @@ type pathRuleSpec struct {
 	Service string
 }
 
+// headerMatchSpec mirrors the supported subset of
+// computepb.HttpHeaderMatch: exactly one of Regex ("" = unset) or
+// Present (nil = unset) applies to the named header.
+type headerMatchSpec struct {
+	Name    string
+	Regex   string
+	Present *bool
+}
+
+// queryParamMatchSpec mirrors the supported subset of
+// computepb.HttpQueryParameterMatch: exactly one of Exact ("" = unset)
+// or Present (nil = unset) applies to the named query parameter.
+type queryParamMatchSpec struct {
+	Name    string
+	Exact   string
+	Present *bool
+}
+
+// routeMatchSpec mirrors the supported subset of
+// computepb.HttpRouteRuleMatch. Exactly one of Prefix or FullPath is
+// set ("" = unset); Headers and QueryParams are AND-ed with the path
+// condition.
+type routeMatchSpec struct {
+	Prefix      string
+	FullPath    string
+	Headers     []headerMatchSpec
+	QueryParams []queryParamMatchSpec
+}
+
+// redirectSpec mirrors the supported subset of
+// computepb.HttpRedirectAction: a path redirect with an explicit
+// response code and strip-query behaviour.
+type redirectSpec struct {
+	Path         string
+	ResponseCode string
+	StripQuery   bool
+}
+
+// routeRuleSpec mirrors the supported subset of
+// computepb.HttpRouteRule: requests matching any of Matches either
+// route to Service or get Redirect (exactly one is set; Service "" =
+// unset). Lower Priority wins.
+type routeRuleSpec struct {
+	Priority int32
+	Matches  []routeMatchSpec
+	Service  string
+	Redirect *redirectSpec
+}
+
 // entrySpec is the in-memory representation of a single host-rule /
 // path-matcher pair that this provider owns. One entry maps to exactly
 // one HostRule (Hosts → name) plus one PathMatcher (name) on the
-// shared URL map.
+// shared URL map. PathRules and RouteRules are mutually exclusive (a
+// GCP pathMatcher accepts one or the other, never both); the resource
+// layer validates this before the spec is built.
 type entrySpec struct {
 	Name           string
 	Hosts          []string
 	DefaultService string
 	Description    string
 	PathRules      []pathRuleSpec
+	RouteRules     []routeRuleSpec
 }
 
 // upsertEntry returns a copy of m with the entry's HostRule and
@@ -81,8 +134,12 @@ func upsertEntry(m *computepb.UrlMap, e entrySpec) *computepb.UrlMap {
 	}
 
 	pathMatcher := &computepb.PathMatcher{
-		Name:           proto.String(e.Name),
-		DefaultService: proto.String(e.DefaultService),
+		Name: proto.String(e.Name),
+	}
+	// DefaultService is optional when route rules cover all traffic
+	// themselves; writing an empty string would be rejected by the API.
+	if e.DefaultService != "" {
+		pathMatcher.DefaultService = proto.String(e.DefaultService)
 	}
 	if e.Description != "" {
 		pathMatcher.Description = proto.String(e.Description)
@@ -97,6 +154,19 @@ func upsertEntry(m *computepb.UrlMap, e entrySpec) *computepb.UrlMap {
 			})
 		}
 		pathMatcher.PathRules = rules
+	}
+
+	if len(e.RouteRules) > 0 {
+		// Splice in ascending priority order so the PATCH body is
+		// deterministic regardless of how the caller (a Terraform
+		// set) ordered the slice.
+		rules := append([]routeRuleSpec(nil), e.RouteRules...)
+		sort.Slice(rules, func(i, j int) bool { return rules[i].Priority < rules[j].Priority })
+		pbRules := make([]*computepb.HttpRouteRule, 0, len(rules))
+		for _, r := range rules {
+			pbRules = append(pbRules, routeRuleToProto(r))
+		}
+		pathMatcher.RouteRules = pbRules
 	}
 
 	out.HostRules = replaceHostRule(out.HostRules, e.Name, hostRule)
@@ -160,6 +230,11 @@ func findEntry(m *computepb.UrlMap, name string) (entrySpec, bool) {
 		})
 	}
 
+	var routeRules []routeRuleSpec
+	for _, r := range matcher.GetRouteRules() {
+		routeRules = append(routeRules, routeRuleFromProto(r))
+	}
+
 	return entrySpec{
 		Name:  name,
 		Hosts: append([]string(nil), host.GetHosts()...),
@@ -175,7 +250,106 @@ func findEntry(m *computepb.UrlMap, name string) (entrySpec, bool) {
 		// being set as an empty string (== absent in state).
 		Description: firstNonEmpty(host.GetDescription(), matcher.GetDescription()),
 		PathRules:   rules,
+		RouteRules:  routeRules,
 	}, true
+}
+
+// routeRuleToProto lowers the supported routeRuleSpec subset into the
+// wire proto. Unset optional fields are left nil so the API never sees
+// empty strings where "absent" is meant.
+func routeRuleToProto(r routeRuleSpec) *computepb.HttpRouteRule {
+	out := &computepb.HttpRouteRule{
+		Priority: proto.Int32(r.Priority),
+	}
+	for _, m := range r.Matches {
+		pm := &computepb.HttpRouteRuleMatch{}
+		if m.Prefix != "" {
+			pm.PrefixMatch = proto.String(m.Prefix)
+		}
+		if m.FullPath != "" {
+			pm.FullPathMatch = proto.String(m.FullPath)
+		}
+		for _, h := range m.Headers {
+			hm := &computepb.HttpHeaderMatch{HeaderName: proto.String(h.Name)}
+			if h.Regex != "" {
+				hm.RegexMatch = proto.String(h.Regex)
+			}
+			if h.Present != nil {
+				hm.PresentMatch = proto.Bool(*h.Present)
+			}
+			pm.HeaderMatches = append(pm.HeaderMatches, hm)
+		}
+		for _, q := range m.QueryParams {
+			qm := &computepb.HttpQueryParameterMatch{Name: proto.String(q.Name)}
+			if q.Exact != "" {
+				qm.ExactMatch = proto.String(q.Exact)
+			}
+			if q.Present != nil {
+				qm.PresentMatch = proto.Bool(*q.Present)
+			}
+			pm.QueryParameterMatches = append(pm.QueryParameterMatches, qm)
+		}
+		out.MatchRules = append(out.MatchRules, pm)
+	}
+	if r.Service != "" {
+		out.Service = proto.String(r.Service)
+	}
+	if r.Redirect != nil {
+		out.UrlRedirect = &computepb.HttpRedirectAction{
+			PathRedirect:         proto.String(r.Redirect.Path),
+			RedirectResponseCode: proto.String(r.Redirect.ResponseCode),
+			StripQuery:           proto.Bool(r.Redirect.StripQuery),
+		}
+	}
+	return out
+}
+
+// routeRuleFromProto is the inverse of routeRuleToProto for the fields
+// this provider supports; anything outside the subset is dropped, which
+// Read surfaces as a diff rather than silently keeping it. Services are
+// canonicalised exactly like DefaultService.
+func routeRuleFromProto(r *computepb.HttpRouteRule) routeRuleSpec {
+	spec := routeRuleSpec{
+		Priority: r.GetPriority(),
+		Service:  canonicalResourcePath(r.GetService()),
+	}
+	for _, m := range r.GetMatchRules() {
+		ms := routeMatchSpec{
+			Prefix:   m.GetPrefixMatch(),
+			FullPath: m.GetFullPathMatch(),
+		}
+		for _, h := range m.GetHeaderMatches() {
+			hs := headerMatchSpec{
+				Name:  h.GetHeaderName(),
+				Regex: h.GetRegexMatch(),
+			}
+			if h.PresentMatch != nil {
+				v := h.GetPresentMatch()
+				hs.Present = &v
+			}
+			ms.Headers = append(ms.Headers, hs)
+		}
+		for _, q := range m.GetQueryParameterMatches() {
+			qs := queryParamMatchSpec{
+				Name:  q.GetName(),
+				Exact: q.GetExactMatch(),
+			}
+			if q.PresentMatch != nil {
+				v := q.GetPresentMatch()
+				qs.Present = &v
+			}
+			ms.QueryParams = append(ms.QueryParams, qs)
+		}
+		spec.Matches = append(spec.Matches, ms)
+	}
+	if rd := r.GetUrlRedirect(); rd != nil {
+		spec.Redirect = &redirectSpec{
+			Path:         rd.GetPathRedirect(),
+			ResponseCode: rd.GetRedirectResponseCode(),
+			StripQuery:   rd.GetStripQuery(),
+		}
+	}
+	return spec
 }
 
 // replaceHostRule rewrites the slice with the new value if a HostRule
