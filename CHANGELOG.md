@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/CruGlobal/terraform-provider-crugcp/compare/v0.1.2...v0.2.0) (2026-07-23)
+
+
+### Added
+
+* add route_rules to crugcp_compute_url_map_host_rule ([#20](https://github.com/CruGlobal/terraform-provider-crugcp/issues/20)) ([e814708](https://github.com/CruGlobal/terraform-provider-crugcp/commit/e8147087872b4f21e7211426c7230b8d6c0ca65d))
+
+
+### Changed
+
+* **deps:** Bump the go-dependencies group with 3 updates ([#18](https://github.com/CruGlobal/terraform-provider-crugcp/issues/18)) ([6ad36cd](https://github.com/CruGlobal/terraform-provider-crugcp/commit/6ad36cd4f9ddd86c19832dd2b647e314afdaa4b9))
+
 ## [0.1.2](https://github.com/CruGlobal/terraform-provider-crugcp/compare/v0.1.1...v0.1.2) (2026-07-17)
 
 
