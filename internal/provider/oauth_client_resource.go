@@ -353,14 +353,20 @@ func (r *iamOAuthClientResource) Create(ctx context.Context, req resource.Create
 		"client_id": clientID,
 	})
 
+	// Retry the PATCH past the post-create 404 window. Its response is
+	// not inspected — awaitConsistent below is what decides the client
+	// really holds the resolved URIs.
 	resolved := substituteClientID(configURIs, clientID)
-	_, err = retryOnNotFound(callCtx, "patch", ref, func() (*iam.OauthClient, error) {
-		return r.cfg.IAM.Projects.Locations.OauthClients.
-			Patch(ref.String(), &iam.OauthClient{AllowedRedirectUris: resolved}).
-			UpdateMask("allowedRedirectUris").
-			Context(callCtx).
-			Do()
-	})
+	_, err = pollOAuthClient(callCtx, "patch", ref,
+		func() (*iam.OauthClient, error) {
+			return r.cfg.IAM.Projects.Locations.OauthClients.
+				Patch(ref.String(), &iam.OauthClient{AllowedRedirectUris: resolved}).
+				UpdateMask("allowedRedirectUris").
+				Context(callCtx).
+				Do()
+		},
+		func(*iam.OauthClient) bool { return true },
+	)
 	if err != nil {
 		saveCreated()
 		resp.Diagnostics.AddError(
@@ -404,18 +410,6 @@ func (r *iamOAuthClientResource) awaitConsistent(
 		},
 		func(got *iam.OauthClient) bool { return matchesWrite(got, want) },
 	)
-}
-
-// retryOnNotFound runs call, retrying only past the post-create 404
-// window. The response is not checked for consistency — callers follow
-// up with awaitConsistent.
-func retryOnNotFound(
-	ctx context.Context,
-	what string,
-	ref oauthClientRef,
-	call func() (*iam.OauthClient, error),
-) (*iam.OauthClient, error) {
-	return pollOAuthClient(ctx, what, ref, call, func(*iam.OauthClient) bool { return true })
 }
 
 // pollOAuthClient re-runs call until it succeeds and settled accepts
