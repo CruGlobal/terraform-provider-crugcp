@@ -24,6 +24,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -582,19 +583,38 @@ func isFingerprintConflict(err error) bool {
 }
 
 func isNotFound(err error) bool {
+	return hasHTTPStatus(err, 404, codes.NotFound)
+}
+
+// isAlreadyExists distinguishes a name collision from other 4xx
+// failures. On OAuth clients it is the tell-tale of a soft-deleted
+// client still holding its name, which deserves a tailored hint.
+func isAlreadyExists(err error) bool {
+	return hasHTTPStatus(err, 409, codes.AlreadyExists)
+}
+
+// hasHTTPStatus normalises the three error shapes this provider sees:
+// gax *apierror.APIError from the Compute gRPC-over-REST clients, plain
+// gRPC statuses, and *googleapi.Error from the google-api-go IAM
+// client.
+func hasHTTPStatus(err error, httpCode int, grpcCode codes.Code) bool {
 	if err == nil {
 		return false
 	}
 	var apiErr *apierror.APIError
 	if errors.As(err, &apiErr) {
-		if apiErr.HTTPCode() == 404 {
+		if apiErr.HTTPCode() == httpCode {
 			return true
 		}
-		if apiErr.GRPCStatus() != nil && apiErr.GRPCStatus().Code() == codes.NotFound {
+		if apiErr.GRPCStatus() != nil && apiErr.GRPCStatus().Code() == grpcCode {
 			return true
 		}
 	}
-	if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+	var gErr *googleapi.Error
+	if errors.As(err, &gErr) && gErr.Code == httpCode {
+		return true
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == grpcCode {
 		return true
 	}
 	return false

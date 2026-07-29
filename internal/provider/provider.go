@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"golang.org/x/oauth2"
+	iam "google.golang.org/api/iam/v1"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 )
@@ -40,12 +41,13 @@ type crugcpProviderModel struct {
 }
 
 // providerConfig is what each resource receives via ProviderData. The
-// compute clients are constructed once at Configure time and shared
-// across resource instances; RequestTimeout governs how long each
+// API clients are constructed once at Configure time and shared across
+// resource instances; RequestTimeout governs how long each
 // PATCH/Wait round-trip is allowed to take.
 type providerConfig struct {
 	URLMaps        *compute.UrlMapsClient
 	GlobalOps      *compute.GlobalOperationsClient
+	IAM            *iam.Service
 	RequestTimeout time.Duration
 }
 
@@ -78,7 +80,7 @@ func (p *crugcpProvider) Metadata(_ context.Context, _ provider.MetadataRequest,
 
 func (p *crugcpProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "The `crugcp` provider exposes individual entries on a shared GCP Compute URL map so multiple Terraform configurations can register host rules and path matchers without conflicting over ownership of the parent URL map.\n\nAuthentication mirrors the `hashicorp/google` provider: by default the provider uses Application Default Credentials, with optional overrides for explicit credentials, a static OAuth access token, or service-account impersonation.",
+		MarkdownDescription: "The `crugcp` provider fills small gaps in the upstream `hashicorp/google` provider for Cru's shared-load-balancer and IAP setup.\n\nIt exposes individual entries on a shared GCP Compute URL map, so multiple Terraform configurations can register host rules and path matchers without conflicting over ownership of the parent URL map, and it manages IAM OAuth clients whose redirect URI has to embed their own server-generated `client_id` — a self-reference the upstream resource can only satisfy across two applies.\n\nAuthentication mirrors the `hashicorp/google` provider: by default the provider uses Application Default Credentials, with optional overrides for explicit credentials, a static OAuth access token, or service-account impersonation.",
 		Attributes: map[string]schema.Attribute{
 			"credentials": schema.StringAttribute{
 				MarkdownDescription: "Either the path to a Google Cloud service account JSON key file or the JSON contents of one. Falls back to the `GOOGLE_CREDENTIALS`, `GOOGLE_APPLICATION_CREDENTIALS`, or `GOOGLE_CLOUD_KEYFILE_JSON` environment variables, then to Application Default Credentials.",
@@ -197,9 +199,21 @@ func (p *crugcpProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		return
 	}
 
+	iamService, err := iam.NewService(ctx, opts...)
+	if err != nil {
+		_ = urlMapsClient.Close()
+		_ = opsClient.Close()
+		resp.Diagnostics.AddError(
+			"Unable to construct IAM client",
+			err.Error(),
+		)
+		return
+	}
+
 	pc := &providerConfig{
 		URLMaps:        urlMapsClient,
 		GlobalOps:      opsClient,
+		IAM:            iamService,
 		RequestTimeout: timeout,
 	}
 	resp.ResourceData = pc
@@ -209,6 +223,7 @@ func (p *crugcpProvider) Configure(ctx context.Context, req provider.ConfigureRe
 func (p *crugcpProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewURLMapHostRuleResource,
+		NewIAMOAuthClientResource,
 	}
 }
 
