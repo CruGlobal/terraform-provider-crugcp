@@ -31,14 +31,71 @@ GCP project.
   global URL map. Concurrent writers are reconciled via the Compute
   API's fingerprint-based optimistic locking with an automatic
   read-modify-write retry loop on HTTP 412.
+- `crugcp_iam_oauth_client` — an IAM OAuth client whose redirect URI
+  may reference its own server-generated `client_id`, so IAP with
+  workforce identity federation can be provisioned in one apply
+  instead of two. See below.
+
+### `crugcp_iam_oauth_client` and the two-apply dance
+
+Setting up IAP with workforce identity federation needs an OAuth client
+whose `allowed_redirect_uris` contains
+`https://iap.googleapis.com/v1/oauth/clientIds/$CLIENT_ID:handleRedirect`
+— where `$CLIENT_ID` is a value GCP only generates once the client
+exists. A resource input depends on one of that same resource's
+outputs, which Terraform cannot express, so
+[Google's documented flow](https://cloud.google.com/iap/docs/use-workforce-identity-federation)
+is: apply with a dummy URI, read back the generated id, edit the config
+to paste it in, apply again. That is
+[hashicorp/terraform-provider-google#22530](https://github.com/hashicorp/terraform-provider-google/issues/22530),
+open since April 2025.
+
+This resource takes the same escape hatch the issue reporter describes:
+write `{clientid}` in the redirect URI and it is substituted during
+create, via a POST immediately followed by a PATCH, presented to
+Terraform as a single create.
+
+```hcl
+resource "crugcp_iam_oauth_client" "iap" {
+  project         = "cru-beacon-stage"
+  oauth_client_id = "iap-workforce"
+  client_type     = "CONFIDENTIAL_CLIENT"
+
+  allowed_grant_types = ["AUTHORIZATION_CODE_GRANT"]
+  allowed_scopes      = ["https://www.googleapis.com/auth/cloud-platform"]
+
+  allowed_redirect_uris = [
+    "https://iap.googleapis.com/v1/oauth/clientIds/{clientid}:handleRedirect",
+  ]
+}
+```
+
+One apply, no config edit in the middle, and — unlike the
+`local-exec` + `ignore_changes` workaround — a real `Read`, so
+out-of-band changes still surface as drift. State keeps the URIs as
+written, placeholder intact; `effective_allowed_redirect_uris` exposes
+what GCP actually holds.
+
+The cost of owning the whole resource rather than patching the upstream
+one: this is a shadow of `google_iam_oauth_client`, so it will not pick
+up upstream schema additions for free. If #22530 is ever fixed, prefer
+the upstream resource.
+
+Note that GCP soft-deletes OAuth clients and reserves the name for
+about 30 days, so a `destroy` followed by an immediate re-apply with
+the same `oauth_client_id` fails until you `gcloud iam oauth-clients
+undelete` it or choose a new id.
 
 ## Requirements
 
 - [Terraform](https://www.terraform.io/downloads.html) >= 1.13
 - [Go](https://golang.org/doc/install) >= 1.26 (only for building from
   source; the exact version is pinned in [`.tool-versions`](./.tool-versions))
-- A pre-existing global Compute URL map you have `compute.urlMaps.get`
-  and `compute.urlMaps.patch` permission on.
+- For `crugcp_compute_url_map_host_rule`: a pre-existing global Compute
+  URL map you have `compute.urlMaps.get` and `compute.urlMaps.patch`
+  permission on.
+- For `crugcp_iam_oauth_client`: `iam.oauthClients.{create,get,update,delete}`
+  on the target project, and the IAM API enabled on it.
 
 ## Using the provider
 
@@ -74,7 +131,7 @@ resource "crugcp_compute_url_map_host_rule" "app_stage" {
 | `credentials`                   | Path to a service-account JSON key file, or the JSON contents inline. Falls back to `GOOGLE_*` env vars, then ADC.   |
 | `access_token`                  | Short-lived OAuth access token. Mutually exclusive with `credentials` and `impersonate_service_account`.             |
 | `impersonate_service_account`   | Service account to impersonate. The principal supplying credentials needs `roles/iam.serviceAccountTokenCreator`.    |
-| `request_timeout`               | Go duration string (default `5m`) applied to each Compute API round-trip — Get + Patch + operation wait.             |
+| `request_timeout`               | Go duration string (default `5m`) applied to each API round-trip — for URL maps, Get + Patch + operation wait.       |
 | `request_reason`                | Value sent in the `X-Goog-Request-Reason` header; surfaces in GCP audit logs.                                        |
 
 Full reference docs (generated from the provider schema) live in
@@ -86,7 +143,14 @@ Full reference docs (generated from the provider schema) live in
 ```sh
 terraform import crugcp_compute_url_map_host_rule.app_stage \
   projects/cru-shared-cloudrun-lb/global/urlMaps/internal-shared/app-stage
+
+terraform import crugcp_iam_oauth_client.iap \
+  projects/cru-beacon-stage/locations/global/oauthClients/iap-workforce
 ```
+
+An imported OAuth client comes back with its generated `client_id`
+folded into `{clientid}`, so the import matches a hand-written config
+rather than pinning a literal UUID.
 
 ## Building from source
 
@@ -166,6 +230,10 @@ export CRUGCP_ACC_BACKEND_SERVICE=projects/.../...
 export CRUGCP_ACC_ALT_BACKEND_SERVICE=projects/.../...
 task testacc
 ```
+
+The OAuth client tests only need `CRUGCP_ACC_PROJECT`; they create and
+destroy their own clients under randomly-generated ids, because the
+30-day name reservation would otherwise make a fixed id single-use.
 
 ## License
 
