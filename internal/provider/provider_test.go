@@ -8,6 +8,7 @@ import (
 	compute "cloud.google.com/go/compute/apiv1"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	iam "google.golang.org/api/iam/v1"
 )
 
 // protoV6ProviderFactories is wired into every resource.TestCase. The
@@ -45,15 +46,30 @@ func preCheck(t *testing.T) {
 	}
 }
 
+// preCheckOAuthClient is the lighter precondition for the IAM OAuth
+// client tests: they create and destroy their own clients, so all they
+// need is a project whose caller holds iam.oauthClients.* permissions.
+func preCheckOAuthClient(t *testing.T) {
+	t.Helper()
+	if os.Getenv(envProject) == "" {
+		t.Fatalf("%s must be set for acceptance tests", envProject)
+	}
+}
+
 // testURLMapsClient returns a Compute URL Maps client built with the
 // same auth defaults as the provider — used in CheckDestroy to confirm
 // entries really do disappear from the URL map after the resource is
 // removed.
 var testURLMapsClient *compute.UrlMapsClient
 
+// testIAMService is the equivalent for the OAuth client tests: used in
+// CheckDestroy to confirm the client really is gone (soft-deleted)
+// rather than trusting Terraform's own state.
+var testIAMService *iam.Service
+
 func TestMain(m *testing.M) {
 	if os.Getenv("TF_ACC") == "" {
-		// Unit tests don't need the client; skip the setup.
+		// Unit tests don't need the clients; skip the setup.
 		os.Exit(m.Run())
 	}
 
@@ -63,6 +79,13 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	testURLMapsClient = client
+
+	iamService, err := iam.NewService(ctx)
+	if err != nil {
+		panic(err)
+	}
+	testIAMService = iamService
+
 	code := m.Run()
 	_ = client.Close()
 	os.Exit(code)
