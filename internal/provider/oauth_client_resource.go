@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
@@ -22,6 +23,25 @@ import (
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	iam "google.golang.org/api/iam/v1"
 )
+
+// apiConsistencyMaxAttempts bounds the wait for the IAM API's reads to
+// catch up with its writes. Two distinct lags were measured against
+// iam.googleapis.com, both around one second:
+//
+//   - after Create returns a fully-populated ACTIVE client, a GET or
+//     PATCH on that same name still 404s for a few hundred ms — which
+//     is exactly where the follow-up placeholder PATCH lands;
+//   - after a PATCH returns the updated client, a GET can still report
+//     the pre-PATCH values.
+//
+// The second one is the dangerous one: Terraform refreshes immediately
+// after apply, so reading stale values there turns into phantom drift
+// on the very next plan. Writes are therefore followed by a poll until
+// the API agrees, rather than trusting the write's own response.
+//
+// Seven attempts with 250ms-doubling backoff waits up to ~16s. In
+// practice one retry is enough.
+const apiConsistencyMaxAttempts = 7
 
 // oauthClientIDPattern mirrors the server-side rule documented on the
 // oauthClientId query parameter: 6–63 chars, lowercase letters, digits
@@ -213,9 +233,15 @@ func (r *iamOAuthClientResource) Configure(_ context.Context, req resource.Confi
 // the real one in once the server has minted the client id. Terraform
 // sees a single create.
 //
-// If the PATCH fails we still persist state for the client that was
-// created — abandoning it would leak a real GCP resource and burn the
-// name for 30 days. The saved state deliberately reflects the
+// Both follow-up calls retry through the API's read-after-create
+// propagation window (see createPropagationMaxAttempts), and Create
+// does not return until the client is confirmed readable — otherwise
+// the next plan's refresh could 404 and silently propose recreating a
+// client that exists.
+//
+// If a follow-up call fails we still persist state for the client that
+// was created — abandoning it would leak a real GCP resource and burn
+// the name for 30 days. The saved state deliberately reflects the
 // provisional URIs, so the next plan shows the repair as a diff.
 func (r *iamOAuthClientResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan iamOAuthClientModel
@@ -277,8 +303,28 @@ func (r *iamOAuthClientResource) Create(ctx context.Context, req resource.Create
 		return
 	}
 
-	if !needsPatch {
+	// saveCreated persists what we know about the client GCP just made,
+	// so a failure past this point reports an error without orphaning
+	// the resource.
+	saveCreated := func() {
 		resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, created, configURIs)...)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	}
+
+	if !needsPatch {
+		// Nothing to substitute, but still wait for the client to
+		// become readable so the next refresh can't 404.
+		confirmed, err := r.awaitConsistent(callCtx, ref, body)
+		if err != nil {
+			saveCreated()
+			resp.Diagnostics.AddError(
+				"OAuth client created but could not be read back",
+				fmt.Sprintf("The client was created and is recorded in state, but reading it back failed. "+
+					"Re-run plan to refresh.\n\nUnderlying error: %s", err),
+			)
+			return
+		}
+		resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, confirmed, configURIs)...)
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
@@ -288,10 +334,9 @@ func (r *iamOAuthClientResource) Create(ctx context.Context, req resource.Create
 		// Belt and braces: clientId is output-only and the API does
 		// return it on create, but resolving the placeholder against
 		// an empty string would silently produce a broken URI.
-		got, getErr := r.cfg.IAM.Projects.Locations.OauthClients.Get(ref.String()).Context(callCtx).Do()
+		got, getErr := r.awaitConsistent(callCtx, ref, body)
 		if getErr != nil {
-			resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, created, configURIs)...)
-			resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+			saveCreated()
 			resp.Diagnostics.AddError(
 				"OAuth client created but its client_id could not be read",
 				fmt.Sprintf("The client exists and has been recorded in state with placeholder redirect URIs still "+
@@ -308,16 +353,16 @@ func (r *iamOAuthClientResource) Create(ctx context.Context, req resource.Create
 		"client_id": clientID,
 	})
 
-	patched, err := r.cfg.IAM.Projects.Locations.OauthClients.
-		Patch(ref.String(), &iam.OauthClient{
-			AllowedRedirectUris: substituteClientID(configURIs, clientID),
-		}).
-		UpdateMask("allowedRedirectUris").
-		Context(callCtx).
-		Do()
+	resolved := substituteClientID(configURIs, clientID)
+	_, err = retryOnNotFound(callCtx, "patch", ref, func() (*iam.OauthClient, error) {
+		return r.cfg.IAM.Projects.Locations.OauthClients.
+			Patch(ref.String(), &iam.OauthClient{AllowedRedirectUris: resolved}).
+			UpdateMask("allowedRedirectUris").
+			Context(callCtx).
+			Do()
+	})
 	if err != nil {
-		resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, created, configURIs)...)
-		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		saveCreated()
 		resp.Diagnostics.AddError(
 			"OAuth client created but its redirect URIs could not be resolved",
 			fmt.Sprintf("The client was created and is recorded in state, but the follow-up PATCH that substitutes "+
@@ -327,8 +372,111 @@ func (r *iamOAuthClientResource) Create(ctx context.Context, req resource.Create
 		return
 	}
 
-	resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, patched, configURIs)...)
+	// Don't trust the PATCH response: wait until a GET agrees, so
+	// Terraform's post-apply refresh can't read the pre-PATCH list.
+	body.AllowedRedirectUris = resolved
+	confirmed, err := r.awaitConsistent(callCtx, ref, body)
+	if err != nil {
+		saveCreated()
+		resp.Diagnostics.AddError(
+			"OAuth client created but the API never reported the resolved redirect URIs",
+			fmt.Sprintf("The create and the follow-up PATCH both succeeded, but reads never caught up. "+
+				"Re-run plan to refresh.\n\nUnderlying error: %s", err),
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, confirmed, configURIs)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// awaitConsistent polls until a GET reports the values just written.
+// See apiConsistencyMaxAttempts for why the write's own response can't
+// be taken at face value.
+func (r *iamOAuthClientResource) awaitConsistent(
+	ctx context.Context,
+	ref oauthClientRef,
+	want *iam.OauthClient,
+) (*iam.OauthClient, error) {
+	return pollOAuthClient(ctx, "get", ref,
+		func() (*iam.OauthClient, error) {
+			return r.cfg.IAM.Projects.Locations.OauthClients.Get(ref.String()).Context(ctx).Do()
+		},
+		func(got *iam.OauthClient) bool { return matchesWrite(got, want) },
+	)
+}
+
+// retryOnNotFound runs call, retrying only past the post-create 404
+// window. The response is not checked for consistency — callers follow
+// up with awaitConsistent.
+func retryOnNotFound(
+	ctx context.Context,
+	what string,
+	ref oauthClientRef,
+	call func() (*iam.OauthClient, error),
+) (*iam.OauthClient, error) {
+	return pollOAuthClient(ctx, what, ref, call, func(*iam.OauthClient) bool { return true })
+}
+
+// pollOAuthClient re-runs call until it succeeds and settled accepts
+// the result. A 404 right after a create means "not propagated yet"
+// rather than "gone", so it is retried; any other error is terminal.
+func pollOAuthClient(
+	ctx context.Context,
+	what string,
+	ref oauthClientRef,
+	call func() (*iam.OauthClient, error),
+	settled func(*iam.OauthClient) bool,
+) (*iam.OauthClient, error) {
+	var lastErr error
+	for attempt := 0; attempt < apiConsistencyMaxAttempts; attempt++ {
+		if attempt > 0 {
+			// 250ms, 500ms, 1s, 2s, 4s, 8s. No jitter: unlike the URL
+			// map retry loop this isn't contending with other writers,
+			// it's waiting on one resource's own propagation.
+			delay := 250 * time.Millisecond * (1 << (attempt - 1))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		got, err := call()
+		switch {
+		case err == nil && settled(got):
+			return got, nil
+		case err == nil:
+			lastErr = fmt.Errorf("the API still reports stale values for %s", ref)
+		case isNotFound(err):
+			lastErr = err
+		default:
+			return nil, err
+		}
+
+		tflog.Debug(ctx, "IAM API not consistent yet; retrying", map[string]any{
+			"name":    ref.String(),
+			"call":    what,
+			"attempt": attempt + 1,
+			"reason":  lastErr.Error(),
+		})
+	}
+	return nil, fmt.Errorf("gave up after %d attempts (~16s): %w", apiConsistencyMaxAttempts, lastErr)
+}
+
+// matchesWrite reports whether the API's view has caught up with the
+// body that was written. Only the fields this resource sends are
+// compared; server-assigned ones (client_id, state) are ignored.
+//
+// The collections are compared order-insensitively because the API
+// makes no promise about echo order.
+func matchesWrite(got, want *iam.OauthClient) bool {
+	return got.DisplayName == want.DisplayName &&
+		got.Description == want.Description &&
+		got.Disabled == want.Disabled &&
+		sameStringMultiset(got.AllowedRedirectUris, want.AllowedRedirectUris) &&
+		sameStringMultiset(got.AllowedGrantTypes, want.AllowedGrantTypes) &&
+		sameStringMultiset(got.AllowedScopes, want.AllowedScopes)
 }
 
 func (r *iamOAuthClientResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -442,17 +590,29 @@ func (r *iamOAuthClientResource) Update(ctx context.Context, req resource.Update
 	callCtx, cancel := context.WithTimeout(ctx, r.cfg.RequestTimeout)
 	defer cancel()
 
-	patched, err := r.cfg.IAM.Projects.Locations.OauthClients.
+	if _, err := r.cfg.IAM.Projects.Locations.OauthClients.
 		Patch(ref.String(), body).
 		UpdateMask(mask).
 		Context(callCtx).
-		Do()
-	if err != nil {
+		Do(); err != nil {
 		resp.Diagnostics.AddError("Unable to update OAuth client", err.Error())
 		return
 	}
 
-	resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, patched, configURIs)...)
+	// Same read-after-write lag as Create: wait for a GET to agree
+	// before handing state back, or the post-apply refresh reports the
+	// pre-update values as drift.
+	confirmed, err := r.awaitConsistent(callCtx, ref, body)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"OAuth client updated but the API never reported the new values",
+			fmt.Sprintf("The PATCH succeeded but reads never caught up. Re-run plan to refresh."+
+				"\n\nUnderlying error: %s", err),
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(applyAPIToState(ctx, &plan, ref, confirmed, configURIs)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 

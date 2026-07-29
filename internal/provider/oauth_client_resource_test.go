@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -258,20 +259,33 @@ func testAccCheckOAuthClientRedirectURIs(project, name string) resource.TestChec
 // testAccCheckOAuthClientDestroyed accepts either outcome GCP offers
 // after a delete: the client is gone, or it lingers in the DELETED
 // state awaiting purge.
+//
+// It polls, because the IAM API's reads lag its writes by a few hundred
+// milliseconds in both directions — the same window the resource's
+// Create has to retry through. A single immediate check reads back the
+// pre-delete ACTIVE client and fails spuriously.
 func testAccCheckOAuthClientDestroyed(project, name string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
 		ref := oauthClientRef{Project: project, Location: "global", ClientID: name}
-		got, err := testIAMService.Projects.Locations.OauthClients.
-			Get(ref.String()).Context(context.Background()).Do()
-		if err != nil {
-			if isNotFound(err) {
+
+		var lastState string
+		for attempt := 0; attempt < 6; attempt++ {
+			if attempt > 0 {
+				time.Sleep(250 * time.Millisecond * (1 << (attempt - 1)))
+			}
+			got, err := testIAMService.Projects.Locations.OauthClients.
+				Get(ref.String()).Context(context.Background()).Do()
+			if err != nil {
+				if isNotFound(err) {
+					return nil
+				}
+				return fmt.Errorf("checking destruction of %s: %w", ref, err)
+			}
+			if got.State == "DELETED" {
 				return nil
 			}
-			return fmt.Errorf("checking destruction of %s: %w", ref, err)
+			lastState = got.State
 		}
-		if got.State != "DELETED" {
-			return fmt.Errorf("%s still exists in state %q after destroy", ref, got.State)
-		}
-		return nil
+		return fmt.Errorf("%s still exists in state %q after destroy", ref, lastState)
 	}
 }
