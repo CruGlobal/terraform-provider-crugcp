@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
@@ -28,13 +29,20 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// fingerprintConflictMaxAttempts caps the read-modify-write retry loop.
-// The GCP Compute API returns HTTP 412 when the URL map's fingerprint
-// changes between Get and Patch, which is exactly what happens when two
-// Terraform runs race against the same URL map. Five tries with
-// exponential backoff covers a handful of concurrent applies without
-// turning a transient race into a 30-minute apply.
-const fingerprintConflictMaxAttempts = 5
+// writeConflictMaxAttempts caps the read-modify-write retry loop.
+//
+// Two transient conditions send us round it again, both symptoms of
+// another writer touching the same URL map:
+//
+//   - HTTP 412, when the fingerprint changes between Get and write;
+//   - HTTP 400 "The resource ... is not ready", when a previous
+//     operation on the map hasn't settled yet.
+//
+// Eight tries with jittered exponential backoff (200ms doubling, so up
+// to ~25s in the worst case) covers a handful of concurrent applies
+// without turning a transient race into a 30-minute apply. The caller's
+// request_timeout bounds the whole loop regardless.
+const writeConflictMaxAttempts = 8
 
 var (
 	_ resource.Resource                = &urlMapHostRuleResource{}
@@ -80,7 +88,7 @@ func (r *urlMapHostRuleResource) Metadata(_ context.Context, req resource.Metada
 
 func (r *urlMapHostRuleResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "`crugcp_compute_url_map_host_rule` registers a single host rule (and the matching path matcher that pairs with it) on a shared global Compute URL map. Multiple Terraform configurations can each own one entry on the same URL map without contending over the parent resource.\n\nThe resource manages exactly one `host_rule` block plus one `path_matcher` block, both keyed by `name`. Both are spliced into the URL map's spec via the Compute API's optimistic-locking PATCH semantics — concurrent writes from other configurations are retried automatically on fingerprint conflict.",
+		MarkdownDescription: "`crugcp_compute_url_map_host_rule` registers a single host rule (and the matching path matcher that pairs with it) on a shared global Compute URL map. Multiple Terraform configurations can each own one entry on the same URL map without contending over the parent resource.\n\nThe resource manages exactly one `host_rule` block plus one `path_matcher` block, both keyed by `name`. Both are spliced into the URL map's spec under the Compute API's fingerprint-based optimistic locking — concurrent writes from other configurations are retried automatically, whether they surface as a fingerprint conflict or as a not-yet-settled URL map.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Composite identifier of the form `projects/{project}/global/urlMaps/{url_map}/{name}`.",
@@ -305,11 +313,12 @@ func (r *urlMapHostRuleResource) Delete(ctx context.Context, req resource.Delete
 		return
 	}
 
-	_, err = r.applyEntry(ctx, ref, state.Name.ValueString(), func(m *computepb.UrlMap) (*computepb.UrlMap, error) {
+	name := state.Name.ValueString()
+	got, err := r.applyEntry(ctx, ref, name, func(m *computepb.UrlMap) (*computepb.UrlMap, error) {
 		// Removing a missing entry is a successful no-op. Calling
 		// removeEntry unconditionally also normalises ordering so
-		// repeated deletes don't trigger surprising Patch payloads.
-		return removeEntry(m, state.Name.ValueString()), nil
+		// repeated deletes don't trigger surprising payloads.
+		return removeEntry(m, name), nil
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -318,6 +327,66 @@ func (r *urlMapHostRuleResource) Delete(ctx context.Context, req resource.Delete
 		}
 		resp.Diagnostics.AddError("Unable to delete URL map host rule", err.Error())
 		return
+	}
+
+	// Confirm against the post-write read rather than trusting the
+	// operation's DONE status. A write that the API accepts but
+	// silently drops is a real failure mode here (see needsFullUpdate),
+	// and reporting a successful destroy for an entry that is still
+	// serving traffic is the worst outcome available: Terraform forgets
+	// the resource and nothing ever cleans it up. Create and Update get
+	// the equivalent check via updateStateFromURLMap.
+	if r.entryStillPresent(ctx, ref, got, name) {
+		resp.Diagnostics.AddError(
+			"URL map host rule still present after delete",
+			fmt.Sprintf("The Compute API reported success but %q is still on %s. The entry has been left in "+
+				"Terraform state so a re-run can retry; remove it by hand if it persists.", name, ref),
+		)
+	}
+}
+
+// entryStillPresent decides whether a delete really failed. got is the
+// post-write read applyEntry already performed; if that still shows the
+// entry, the read is re-taken a couple of times before calling it a
+// failure, so a momentarily stale GET can't turn a healthy destroy into
+// a spurious error. This cannot mask a genuine problem in the other
+// direction — a write the API silently dropped never starts reporting
+// the entry as absent.
+func (r *urlMapHostRuleResource) entryStillPresent(
+	ctx context.Context,
+	ref urlMapRef,
+	got *computepb.UrlMap,
+	name string,
+) bool {
+	for attempt := 0; ; attempt++ {
+		if _, present := findEntry(got, name); !present {
+			return false
+		}
+		if attempt >= 2 {
+			return true
+		}
+
+		select {
+		case <-time.After(500 * time.Millisecond * (1 << attempt)):
+		case <-ctx.Done():
+			return true
+		}
+
+		readCtx, cancel := context.WithTimeout(ctx, r.cfg.RequestTimeout)
+		fresh, err := r.cfg.URLMaps.Get(readCtx, &computepb.GetUrlMapRequest{
+			Project: ref.Project,
+			UrlMap:  ref.Name,
+		})
+		cancel()
+		if err != nil {
+			if isNotFound(err) {
+				// Parent map vanished; the entry went with it.
+				return false
+			}
+			// Can't re-verify, so trust the read we already have.
+			return true
+		}
+		got = fresh
 	}
 }
 
@@ -359,8 +428,11 @@ func (r *urlMapHostRuleResource) applyEntry(
 	name string,
 	mutate func(*computepb.UrlMap) (*computepb.UrlMap, error),
 ) (*computepb.UrlMap, error) {
-	var lastFingerprint string
-	for attempt := 0; attempt < fingerprintConflictMaxAttempts; attempt++ {
+	var (
+		lastFingerprint string
+		lastErr         error
+	)
+	for attempt := 0; attempt < writeConflictMaxAttempts; attempt++ {
 		callCtx, cancel := context.WithTimeout(ctx, r.cfg.RequestTimeout)
 
 		current, err := r.cfg.URLMaps.Get(callCtx, &computepb.GetUrlMapRequest{
@@ -387,11 +459,22 @@ func (r *urlMapHostRuleResource) applyEntry(
 		}
 		lastFingerprint = next.GetFingerprint()
 
-		op, err := r.cfg.URLMaps.Patch(callCtx, &computepb.PatchUrlMapRequest{
-			Project:        ref.Project,
-			UrlMap:         ref.Name,
-			UrlMapResource: next,
-		})
+		var op *compute.Operation
+		if needsFullUpdate(next) {
+			// PUT: the only way to express "this list is now empty".
+			// See needsFullUpdate for why PATCH cannot.
+			op, err = r.cfg.URLMaps.Update(callCtx, &computepb.UpdateUrlMapRequest{
+				Project:        ref.Project,
+				UrlMap:         ref.Name,
+				UrlMapResource: next,
+			})
+		} else {
+			op, err = r.cfg.URLMaps.Patch(callCtx, &computepb.PatchUrlMapRequest{
+				Project:        ref.Project,
+				UrlMap:         ref.Name,
+				UrlMapResource: next,
+			})
+		}
 		if err == nil {
 			err = op.Wait(callCtx)
 		}
@@ -414,20 +497,23 @@ func (r *urlMapHostRuleResource) applyEntry(
 			return got, nil
 		}
 
-		if !isFingerprintConflict(err) {
+		if !isRetryableWriteError(err) {
 			return nil, err
 		}
+		lastErr = err
 
-		tflog.Debug(ctx, "fingerprint conflict on URL map patch; retrying", map[string]any{
+		tflog.Debug(ctx, "retryable write conflict on URL map; retrying", map[string]any{
 			"url_map":     ref.String(),
 			"name":        name,
 			"attempt":     attempt + 1,
 			"fingerprint": lastFingerprint,
+			"error":       err.Error(),
 		})
 
 		// Exponential backoff with full jitter: 200ms, 400ms, 800ms,
-		// 1.6s, 3.2s. Bounded by the configured request_timeout
-		// outside this function via the caller's context.
+		// … doubling per attempt. Bounded by the configured
+		// request_timeout outside this function via the caller's
+		// context.
 		base := 200 * time.Millisecond * (1 << attempt)
 		// #nosec G404 -- jitter only; not used for security.
 		sleep := time.Duration(rand.Int63n(int64(base)))
@@ -437,7 +523,39 @@ func (r *urlMapHostRuleResource) applyEntry(
 			return nil, ctx.Err()
 		}
 	}
-	return nil, fmt.Errorf("gave up after %d fingerprint conflicts on %s; another writer is contending for this URL map", fingerprintConflictMaxAttempts, ref)
+	return nil, fmt.Errorf("gave up after %d write conflicts on %s; another writer is contending for this URL map: %w", writeConflictMaxAttempts, ref, lastErr)
+}
+
+// needsFullUpdate reports whether the desired spec has to be written
+// with Update (HTTP PUT) instead of Patch (HTTP PATCH).
+//
+// urlMaps.patch applies JSON merge patch semantics, where a key absent
+// from the request body means "leave this field alone". The generated
+// Compute client marshals request bodies with
+// protojson.MarshalOptions{AllowPartial: true} — no EmitUnpopulated,
+// no EmitDefaultValues — so an empty repeated field is omitted from the
+// JSON entirely rather than sent as []. The two behaviours combine into
+// a trap: removing the last entry on a URL map produces a body with no
+// hostRules and no pathMatchers key, and the API treats that as "change
+// nothing". The operation still reports DONE, so the delete looks like
+// it succeeded while the host rule is left live. Verified against the
+// real API: such a PATCH doesn't even change the URL map's fingerprint.
+//
+// The marshal options are hard-coded inside the generated client, so
+// this can't be fixed by emitting []. urlMaps.update is a PUT — a full
+// replace, where an omitted field genuinely means empty — and it still
+// honours the fingerprint, so optimistic locking is unaffected.
+//
+// PATCH is kept for every non-clearing write on purpose. This resource
+// splices into a URL map that other configurations also write to, and
+// PATCH preserves fields this provider's protobuf doesn't model, where
+// a PUT would silently drop them. PUT is therefore used only where
+// PATCH is provably incapable of expressing the change.
+func needsFullUpdate(next *computepb.UrlMap) bool {
+	if next == nil {
+		return false
+	}
+	return len(next.GetHostRules()) == 0 || len(next.GetPathMatchers()) == 0
 }
 
 // planToEntrySpec is a small adapter that pulls the user-facing fields
@@ -553,6 +671,42 @@ func updateStateFromURLMap(ctx context.Context, m *urlMapHostRuleModel, ref urlM
 
 func buildID(ref urlMapRef, name string) string {
 	return fmt.Sprintf("%s/%s", ref, name)
+}
+
+// isRetryableWriteError reports whether a failed write is worth another
+// trip round the read-modify-write loop. Both conditions mean "another
+// writer got here first", which on a deliberately shared URL map is
+// routine rather than exceptional.
+func isRetryableWriteError(err error) bool {
+	return isFingerprintConflict(err) || isResourceNotReady(err)
+}
+
+// isResourceNotReady matches HTTP 400 "The resource ... is not ready",
+// which Compute returns when a previous operation on the URL map hasn't
+// settled yet. Observed in acceptance testing when two resources apply
+// against the same map concurrently: without this the apply fails hard
+// even though simply waiting would have worked.
+//
+// The substring is required, not just the status code — 400 is also how
+// the API reports genuinely invalid specs, and retrying those would turn
+// a clear error into a slow one.
+func isResourceNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	if !strings.Contains(err.Error(), "is not ready") {
+		return false
+	}
+	var apiErr *apierror.APIError
+	if errors.As(err, &apiErr) && apiErr.HTTPCode() == 400 {
+		return true
+	}
+	// The REST transport maps 400 to InvalidArgument; accept that too
+	// rather than relying on HTTPCode being populated.
+	if st, ok := status.FromError(err); ok && st.Code() == codes.InvalidArgument {
+		return true
+	}
+	return false
 }
 
 // isFingerprintConflict matches the response shape the Compute API
