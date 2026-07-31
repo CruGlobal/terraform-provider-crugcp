@@ -4,14 +4,14 @@ page_title: "crugcp_compute_url_map_host_rule Resource - crugcp"
 subcategory: ""
 description: |-
   crugcp_compute_url_map_host_rule registers a single host rule (and the matching path matcher that pairs with it) on a shared global Compute URL map. Multiple Terraform configurations can each own one entry on the same URL map without contending over the parent resource.
-  The resource manages exactly one host_rule block plus one path_matcher block, both keyed by name. Both are spliced into the URL map's spec via the Compute API's optimistic-locking PATCH semantics — concurrent writes from other configurations are retried automatically on fingerprint conflict.
+  The resource manages exactly one host_rule block plus one path_matcher block, both keyed by name. Both are spliced into the URL map's spec under the Compute API's fingerprint-based optimistic locking — concurrent writes from other configurations are retried automatically, whether they surface as a fingerprint conflict or as a not-yet-settled URL map.
 ---
 
 # crugcp_compute_url_map_host_rule (Resource)
 
 `crugcp_compute_url_map_host_rule` registers a single host rule (and the matching path matcher that pairs with it) on a shared global Compute URL map. Multiple Terraform configurations can each own one entry on the same URL map without contending over the parent resource.
 
-The resource manages exactly one `host_rule` block plus one `path_matcher` block, both keyed by `name`. Both are spliced into the URL map's spec via the Compute API's optimistic-locking PATCH semantics — concurrent writes from other configurations are retried automatically on fingerprint conflict.
+The resource manages exactly one `host_rule` block plus one `path_matcher` block, both keyed by `name`. Both are spliced into the URL map's spec under the Compute API's fingerprint-based optimistic locking — concurrent writes from other configurations are retried automatically, whether they surface as a fingerprint conflict or as a not-yet-settled URL map.
 
 ## Example Usage
 

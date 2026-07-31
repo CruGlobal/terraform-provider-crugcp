@@ -586,6 +586,10 @@ func testAccCheckPathRulePaths(name string, wantPaths ...string) resource.TestCh
 	}
 }
 
+// testAccCheckURLMapEntryAbsent asserts that neither half of the entry
+// survives. It deliberately does not use findEntry: that requires the
+// host rule AND the path matcher to be present, so a half-removed entry
+// reads as "absent" and would leak silently forever.
 func testAccCheckURLMapEntryAbsent(name string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
 		ref, _ := parseURLMapRef(os.Getenv(envURLMap))
@@ -596,8 +600,21 @@ func testAccCheckURLMapEntryAbsent(name string) resource.TestCheckFunc {
 		if err != nil {
 			return err
 		}
-		if _, ok := findEntry(got, name); ok {
-			return fmt.Errorf("entry %q still present in %s", name, ref)
+		var leaked []string
+		for _, h := range got.GetHostRules() {
+			if h.GetPathMatcher() == name {
+				leaked = append(leaked, "host rule")
+				break
+			}
+		}
+		for _, p := range got.GetPathMatchers() {
+			if p.GetName() == name {
+				leaked = append(leaked, "path matcher")
+				break
+			}
+		}
+		if len(leaked) > 0 {
+			return fmt.Errorf("entry %q still present in %s (%s)", name, ref, strings.Join(leaked, " + "))
 		}
 		return nil
 	}

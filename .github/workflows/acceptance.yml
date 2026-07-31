@@ -43,6 +43,9 @@ concurrency:
   # One acceptance run at a time — concurrent runs would race each
   # other over the shared URL map and trip the very fingerprint-retry
   # logic the tests are meant to exercise from a single writer.
+  #
+  # This only serializes across runs; `max-parallel: 1` on the matrix
+  # below does the same within a run.
   group: acceptance
   cancel-in-progress: false
 
@@ -52,6 +55,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
+      # Every leg writes the same CRUGCP_ACC_URL_MAP, so they must not
+      # run at the same time: concurrent writers race over the URL map's
+      # fingerprint and, worse, each leg sees host rules the other leg
+      # created or deleted mid-test. The tests assert on the map's exact
+      # contents, so that's a false failure — and it can also mask real
+      # bugs by leaving the fixture dirty (a leftover entry hid the
+      # delete-the-last-host-rule bug fixed in a160390).
+      #
+      # Serializing is the cheap fix; the alternative is a separate URL
+      # map per leg, which means another set of GCP fixtures and repo
+      # secrets for no test coverage gained.
+      max-parallel: 1
       fail-fast: false
       matrix:
         terraform:

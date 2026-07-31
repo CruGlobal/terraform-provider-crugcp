@@ -95,7 +95,7 @@ func (p *crugcpProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 				Optional:            true,
 			},
 			"request_timeout": schema.StringAttribute{
-				MarkdownDescription: "Timeout applied to each underlying Compute API round-trip (Get + Patch + operation wait) as a Go `time.Duration` string (for example `\"60s\"`, `\"5m\"`). Defaults to `5m` — global URL map operations regularly take 30–90s to propagate, so shorter timeouts trip on healthy applies.",
+				MarkdownDescription: "Timeout applied to each underlying Compute API round-trip (Get + write + operation wait) as a Go `time.Duration` string (for example `\"60s\"`, `\"5m\"`). Defaults to `5m` — global URL map operations regularly take 30–90s to propagate, so shorter timeouts trip on healthy applies.",
 				Optional:            true,
 			},
 			"request_reason": schema.StringAttribute{
