@@ -1,18 +1,18 @@
 module github.com/CruGlobal/terraform-provider-crugcp
 
-go 1.25.8
+go 1.26.0
 
 require (
 	cloud.google.com/go/compute v1.67.0
-	github.com/googleapis/gax-go/v2 v2.24.0
+	github.com/googleapis/gax-go/v2 v2.24.1
 	github.com/hashicorp/terraform-plugin-docs v0.25.0
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 	github.com/hashicorp/terraform-plugin-framework-validators v0.19.0
 	github.com/hashicorp/terraform-plugin-go v0.31.0
 	github.com/hashicorp/terraform-plugin-log v0.11.0
 	github.com/hashicorp/terraform-plugin-testing v1.16.0
-	golang.org/x/oauth2 v0.36.0
-	google.golang.org/api v0.295.0
+	golang.org/x/oauth2 v0.37.0
+	google.golang.org/api v0.297.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 )
