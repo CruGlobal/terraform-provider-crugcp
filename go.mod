@@ -3,7 +3,7 @@ module github.com/CruGlobal/terraform-provider-crugcp
 go 1.26.0
 
 require (
-	cloud.google.com/go/compute v1.67.0
+	cloud.google.com/go/compute v1.68.0
 	github.com/googleapis/gax-go/v2 v2.24.1
 	github.com/hashicorp/terraform-plugin-docs v0.25.0
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
