@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/CruGlobal/terraform-provider-crugcp/compare/v0.2.0...v0.2.1) (2026-07-31)
+
+
+### Fixed
+
+* URL map host rule delete silently dropped the last entry ([#25](https://github.com/CruGlobal/terraform-provider-crugcp/issues/25)) ([04c6674](https://github.com/CruGlobal/terraform-provider-crugcp/commit/04c66746c041f90ae007a9df9533da9161e72dc8))
+
+
+### Changed
+
+* **deps:** Bump google.golang.org/api from 0.289.0 to 0.290.0 in the go-dependencies group ([#24](https://github.com/CruGlobal/terraform-provider-crugcp/issues/24)) ([39e1198](https://github.com/CruGlobal/terraform-provider-crugcp/commit/39e1198f170a53cbc2101db6d766635f248ed20f))
+
 ## [0.2.0](https://github.com/CruGlobal/terraform-provider-crugcp/compare/v0.1.2...v0.2.0) (2026-07-23)
 
 
