@@ -3,7 +3,7 @@ module github.com/CruGlobal/terraform-provider-crugcp
 go 1.26.0
 
 require (
-	cloud.google.com/go/compute v1.74.1
+	cloud.google.com/go/compute v1.75.0
 	github.com/googleapis/gax-go/v2 v2.27.0
 	github.com/hashicorp/terraform-plugin-docs v0.25.0
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
@@ -11,15 +11,15 @@ require (
 	github.com/hashicorp/terraform-plugin-go v0.31.0
 	github.com/hashicorp/terraform-plugin-log v0.11.0
 	github.com/hashicorp/terraform-plugin-testing v1.16.0
-	golang.org/x/oauth2 v0.37.0
-	google.golang.org/api v0.310.0
+	golang.org/x/oauth2 v0.38.0
+	google.golang.org/api v0.311.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )
 
 require (
 	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a // indirect
-	cloud.google.com/go/auth/oauth2adapt v0.3.0 // indirect
+	cloud.google.com/go/auth/oauth2adapt v0.3.1 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	github.com/BurntSushi/toml v1.2.1 // indirect
 	github.com/Kunde21/markdownfmt/v3 v3.1.0 // indirect
@@ -93,7 +93,7 @@ require (
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
 	golang.org/x/mod v0.42.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
@@ -101,7 +101,7 @@ require (
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/genproto v0.0.0-20261012220534-4341edf3f941 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261012220534-4341edf3f941 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
 	gopkg.in/yaml.v2 v2.3.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
